@@ -50,7 +50,7 @@ Don't just watch your movies—step inside them. With the new **SBS Movie Maker*
 Fully compatible with XREAL (Air/Air 2/Pro/Ultra/One), VITURE (Pro XR/One/Luma), Rokid (Max/Pro), RayNeo (Air 2/3S), Apple Vision Pro, Meta Quest, and any display that supports standard Side-by-Side content.
 
 [![ml-sharp-3d-sbs-video](https://i.ytimg.com/vi/WStBISqtCDo/maxresdefault.jpg)](https://youtu.be/WStBISqtCDo?si=C4t7jL6CJ9JvdgX0)
-### click image to watch video [ml-sharp](https://youtu.be/aZaGBWggVPc?si=C4t7jL6CJ9JvdgX0)
+### click image to watch video [ml-sharp](https://youtu.be/WStBISqtCDo?si=C4t7jL6CJ9JvdgX0)
 
 This is the original Uganda video. You can convert any video to 3D SBS
 
