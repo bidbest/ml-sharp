@@ -37,13 +37,13 @@ try:
                     "torch", "torchvision", "torchaudio"
                 ])
                 
-                # Install GPU versions (using stable CUDA 12.x index)
+                # Install GPU versions (using stable CUDA 12.1 index for best gsplat compatibility)
                 # Note: Using --no-cache-dir to avoid picking up the cached CPU wheel again
-                print("Installing CUDA-enabled PyTorch... (This may take a while)")
+                print("Installing CUDA-enabled PyTorch (cu121)... (This may take a while)")
                 subprocess.check_call([
                     sys.executable, "-m", "pip", "install", 
                     "torch", "torchvision", "torchaudio",
-                    "--index-url", "https://download.pytorch.org/whl/cu124",
+                    "--index-url", "https://download.pytorch.org/whl/cu121",
                     "--no-cache-dir"
                 ])
                 
@@ -55,7 +55,7 @@ try:
                 
             except subprocess.CalledProcessError as e:
                 print(f"ERROR: Failed to auto-install PyTorch: {e}")
-                print("Please manually run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124")
+                print("Please manually run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121")
                 # Continue anyway, falling back to CPU logic below
 except ImportError:
     pass
@@ -63,21 +63,23 @@ except ImportError:
 
 import numpy as np
 import imageio.v2 as iio
+import imageio_ffmpeg
 import torch.nn.functional as F
+from PIL import Image
 from flask import Flask, jsonify, render_template, request, send_file
 
 from sharp.models import PredictorParams, RGBGaussianPredictor, create_predictor
 from sharp.utils import io
 from sharp.utils.gaussians import Gaussians3D, save_ply, unproject_gaussians
+# Imports for SBS Rendering
+from sharp.utils import gsplat, camera
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 LOGGER = logging.getLogger(__name__)
 
 # SILENCE WERKZEUG (HTTP LOGS)
-# This prevents the console from being flooded by /job_status polling
 try:
-    # Set to ERROR to only see actual problems, not every GET request
     logging.getLogger('werkzeug').setLevel(logging.ERROR)
 except Exception:
     pass
@@ -107,11 +109,9 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
 
 def get_device() -> torch.device:
     """Get the best available device."""
-    # If the model is already loaded, return the device it is on
     if _model_cache["device"] is not None:
         return _model_cache["device"]
 
-    # Independent check if model isn't loaded yet
     if torch.cuda.is_available():
         return torch.device("cuda")
     elif torch.mps.is_available():
@@ -125,7 +125,6 @@ def get_predictor() -> tuple[RGBGaussianPredictor, torch.device]:
     if _model_cache["predictor"] is None:
         target_device = torch.device("cpu")
         
-        # 1. Aggressive Device Detection & Diagnostics
         if torch.cuda.is_available():
             target_device = torch.device("cuda")
             try:
@@ -141,7 +140,6 @@ def get_predictor() -> tuple[RGBGaussianPredictor, torch.device]:
 
         LOGGER.info(f"Targeting device for inference: {target_device}")
 
-        # 2. Download and Load Model (Always load to CPU first for safety)
         LOGGER.info(f"Downloading model from {DEFAULT_MODEL_URL}")
         try:
             state_dict = torch.hub.load_state_dict_from_url(
@@ -158,17 +156,13 @@ def get_predictor() -> tuple[RGBGaussianPredictor, torch.device]:
         predictor.load_state_dict(state_dict)
         predictor.eval()
         
-        # 3. Move to Target Device (with Fallback)
         final_device = torch.device("cpu")
         if target_device.type != "cpu":
             try:
                 LOGGER.info(f"Moving model to {target_device}...")
                 predictor.to(target_device)
-                
-                # Verify functionality with a dummy tensor
                 dummy = torch.zeros(1).to(target_device)
                 del dummy
-                
                 final_device = target_device
             except RuntimeError as e:
                 LOGGER.warning(f"Failed to initialize on {target_device}: {e}.")
@@ -191,7 +185,7 @@ def predict_image(
     image: np.ndarray,
     f_px: float,
     device: torch.device,
-    use_fp16: bool = False  # <--- Added parameter
+    use_fp16: bool = False
 ) -> Gaussians3D:
     """Predict Gaussians from an image."""
     internal_shape = (1536, 1536)
@@ -207,14 +201,11 @@ def predict_image(
         align_corners=True,
     )
 
-    # Predict Gaussians in the NDC space.
-    # <--- Added FP16 Logic Context
     if use_fp16 and device.type == "cuda":
         with torch.amp.autocast("cuda", dtype=torch.float16):
             gaussians_ndc = predictor(image_resized_pt, disparity_factor)
     else:
         gaussians_ndc = predictor(image_resized_pt, disparity_factor)
-    # <--- End FP16 Logic
 
     intrinsics = (
         torch.tensor(
@@ -232,7 +223,6 @@ def predict_image(
     intrinsics_resized[0] *= internal_shape[0] / width
     intrinsics_resized[1] *= internal_shape[1] / height
 
-    # Convert Gaussians to metrics space.
     gaussians = unproject_gaussians(
         gaussians_ndc, torch.eye(4).to(device), intrinsics_resized, internal_shape
     )
@@ -262,9 +252,7 @@ def generate():
     if file.filename == "":
         return jsonify({"error": "No file selected"}), 400
 
-    # Get Quality/FP16 Setting
     quality = request.form.get('quality', 'balanced')
-    # If user selected 'fast', we use half-precision (FP16)
     use_fp16 = (quality == 'fast')
 
     allowed_extensions = {".png", ".jpg", ".jpeg", ".heic", ".heif", ".tiff", ".tif", ".webp"}
@@ -273,7 +261,6 @@ def generate():
         return jsonify({"error": f"Unsupported file type: {ext}"}), 400
 
     try:
-        # Save uploaded file temporarily
         unique_id = str(uuid.uuid4())[:8]
         original_stem = Path(file.filename).stem
 
@@ -283,24 +270,17 @@ def generate():
 
         LOGGER.info(f"Processing uploaded file: {file.filename} | Quality: {quality} | FP16: {use_fp16}")
 
-        # Load the image
         image, _, f_px = io.load_rgb(tmp_path)
         height, width = image.shape[:2]
 
-        # Get the model
         predictor, device = get_predictor()
-
-        # Run prediction
         gaussians = predict_image(predictor, image, f_px, device, use_fp16=use_fp16)
 
-        # Save the PLY file
         output_filename = f"{original_stem}_{unique_id}.ply"
         output_path = OUTPUT_DIR / output_filename
         save_ply(gaussians, f_px, (height, width), output_path)
 
         LOGGER.info(f"Saved PLY to: {output_path}")
-
-        # Clean up temp file
         tmp_path.unlink()
 
         return jsonify({
@@ -316,11 +296,9 @@ def generate():
 
 
 def _process_video_job(job_id, tmp_path, original_stem, unique_id, predictor, device, fps, use_fp16):
-    """Background worker to process video frames."""
+    """Background worker to process video frames into PLY sequence."""
     reader = None
     try:
-        # Pass 1: Get Total Frames
-        # We open a dedicated reader just for counting to avoid iterator consumption issues
         total_frames = 0
         try:
             tmp_reader = iio.get_reader(tmp_path)
@@ -330,62 +308,47 @@ def _process_video_job(job_id, tmp_path, original_stem, unique_id, predictor, de
         except Exception:
             _active_jobs[job_id]['total_frames'] = 0
 
-        # Pass 2: Main Processing
-        # Re-open reader for the actual processing loop
         reader = iio.get_reader(tmp_path)
         
         for i, frame in enumerate(reader):
-            # Check for stop signal
             if _active_jobs[job_id]['stop_signal']:
                 LOGGER.info(f"Job {job_id} stopped by user.")
                 _active_jobs[job_id]['status'] = 'stopped'
                 break
 
             try:
-                # Frame is numpy array (H, W, C)
                 if frame.shape[2] > 3:
                     frame = frame[:, :, :3]
                 
                 h, w = frame.shape[:2]
                 f_px = io.convert_focallength(w, h, 30.0)
 
-                # Predict
                 gaussians = predict_image(predictor, frame, f_px, device, use_fp16=use_fp16)
 
-                # Save PLY
                 frame_filename = f"{original_stem}_{unique_id}_f{i:04d}.ply"
                 output_path = OUTPUT_DIR / frame_filename
                 save_ply(gaussians, f_px, (h, w), output_path)
                 
-                # Cleanup tensors to prevent memory accumulation causing hangs
                 del gaussians
                 
-                # MEMORY MANAGEMENT
-                # Crucial for preventing hangs on Apple MPS and long videos on CUDA
-                if i % 2 == 0:  # Check frequently
+                if i % 2 == 0:
                     if device.type == 'cuda':
                         torch.cuda.empty_cache()
                     elif device.type == 'mps':
                         try:
-                            # MPS requires sync to prevent command buffer from filling up
                             torch.mps.empty_cache()
                             torch.mps.synchronize() 
                         except Exception:
-                            pass # Fallback for older torch versions
-                    
-                    # Force Python Garbage Collection
+                            pass
                     gc.collect()
                     
             except Exception as e:
                 LOGGER.error(f"Error processing frame {i}: {e}")
-                # We continue to the next frame instead of crashing the whole job
                 continue 
 
-            # Update job state
             _active_jobs[job_id]['files'].append(frame_filename)
             _active_jobs[job_id]['processed_frames'] = i + 1
             
-            # Log progress (Server side log) - reduced frequency
             if i % 10 == 0 or i == total_frames - 1:
                 LOGGER.info(f"Job {job_id}: Processed frame {i+1} / {total_frames}")
 
@@ -397,7 +360,6 @@ def _process_video_job(job_id, tmp_path, original_stem, unique_id, predictor, de
         _active_jobs[job_id]['status'] = 'error'
         _active_jobs[job_id]['error_msg'] = str(e)
     finally:
-        # Cleanup
         if reader:
             try:
                 reader.close()
@@ -408,6 +370,239 @@ def _process_video_job(job_id, tmp_path, original_stem, unique_id, predictor, de
                 tmp_path.unlink()
             except:
                 pass
+
+
+def _process_sbs_video_job(job_id, tmp_path, original_stem, unique_id, predictor, device, fps, use_fp16):
+    """Background worker for SBS 3D Movie generation (Audio extraction -> Render -> Stitch -> Video)."""
+    
+    # Verify CUDA for rendering
+    if device.type != 'cuda':
+        _active_jobs[job_id]['status'] = 'error'
+        _active_jobs[job_id]['error_msg'] = "SBS Rendering requires a CUDA GPU. CPU/MPS not supported for server-side rendering."
+        return
+
+    work_dir = OUTPUT_DIR / f"work_{unique_id}"
+    work_dir.mkdir(exist_ok=True)
+    audio_path = work_dir / "audio.aac"
+    
+    reader = None
+    
+    try:
+        # 1. Extract Audio
+        LOGGER.info(f"Job {job_id}: Extracting audio...")
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        
+        # Check if video has audio track first could be useful, but let's try extraction
+        # -vn: no video, -acodec copy: copy audio stream
+        audio_cmd = [
+            ffmpeg_exe, "-y", "-i", str(tmp_path), 
+            "-vn", "-acodec", "copy", str(audio_path)
+        ]
+        has_audio = False
+        try:
+            # Capture output to suppress console spam, check return code
+            subprocess.run(audio_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if audio_path.exists() and audio_path.stat().st_size > 0:
+                has_audio = True
+        except subprocess.CalledProcessError:
+            LOGGER.warning(f"Job {job_id}: No audio track found or extraction failed. Proceeding without audio.")
+
+        # 2. Setup Processing Loop
+        try:
+            reader = iio.get_reader(tmp_path)
+            total_frames = reader.count_frames()
+            _active_jobs[job_id]['total_frames'] = total_frames
+        except Exception:
+            _active_jobs[job_id]['total_frames'] = 0
+            # Re-open if count failed
+            reader = iio.get_reader(tmp_path)
+
+        # Initialize Renderer
+        # Target resolution: 1920x1080 per eye -> 3840x1080 total
+        render_w, render_h = 1920, 1080
+        
+        # Robust Renderer Initialization for Windows
+        try:
+            renderer = gsplat.GSplatRenderer(color_space="sRGB")
+        except Exception as e:
+            err_str = str(e)
+            if "DLL load failed" in err_str or "cl" in err_str or "compiler" in err_str.lower():
+                raise RuntimeError(
+                    "Missing 'gsplat' binaries. This usually means PyTorch/CUDA version mismatch or missing Visual Studio Build Tools. "
+                    "Try reinstalling with PyTorch CUDA 12.1 (cu121) to get compatible wheels."
+                )
+            raise e
+        
+        # Stereo Setup
+        # Base IPD offset approx 0.06 units total. 
+        # Left eye: -0.03, Right eye: +0.03
+        stereo_offset = 0.03 
+
+        # 3. Frame Loop
+        png_files = []
+        
+        for i, frame in enumerate(reader):
+            if _active_jobs[job_id]['stop_signal']:
+                LOGGER.info(f"Job {job_id} stopped by user.")
+                _active_jobs[job_id]['status'] = 'stopped'
+                break
+
+            try:
+                if frame.shape[2] > 3: frame = frame[:, :, :3]
+                
+                # Predict
+                h, w = frame.shape[:2]
+                f_px = io.convert_focallength(w, h, 30.0)
+                gaussians = predict_image(predictor, frame, f_px, device, use_fp16=use_fp16)
+
+                # -- Rendering Logic --
+                
+                # Prepare Intrinsics for 1920x1080 render
+                # We scale f_px to match the target render resolution relative to input
+                scale_x = render_w / w
+                scale_y = render_h / h
+                # Use the larger scale to cover FoV or average? Let's assume input fits 
+                # roughly into standard view.
+                # Actually, standard sharp camera logic:
+                f_px_render = f_px * (render_w / w) 
+
+                intrinsics = torch.tensor([
+                    [f_px_render, 0, render_w / 2, 0],
+                    [0, f_px_render, render_h / 2, 0],
+                    [0, 0, 1, 0],
+                    [0, 0, 0, 1],
+                ], device=device, dtype=torch.float32)
+
+                # Prepare Extrinsics (Stereo)
+                # Left Eye
+                ext_left = torch.eye(4, device=device)
+                ext_left[0, 3] = stereo_offset # Translate camera right = scene moves left
+                
+                # Right Eye
+                ext_right = torch.eye(4, device=device)
+                ext_right[0, 3] = -stereo_offset 
+                
+                # Render Left
+                out_left = renderer(
+                    gaussians, 
+                    extrinsics=ext_left.unsqueeze(0), 
+                    intrinsics=intrinsics.unsqueeze(0),
+                    image_width=render_w, image_height=render_h
+                )
+                img_left = (out_left.color[0].permute(1, 2, 0).clamp(0, 1) * 255).byte().cpu().numpy()
+
+                # Render Right
+                out_right = renderer(
+                    gaussians, 
+                    extrinsics=ext_right.unsqueeze(0), 
+                    intrinsics=intrinsics.unsqueeze(0),
+                    image_width=render_w, image_height=render_h
+                )
+                img_right = (out_right.color[0].permute(1, 2, 0).clamp(0, 1) * 255).byte().cpu().numpy()
+
+                # Stitch (Side-by-Side)
+                # Shape is (H, W, C). Concatenate along Width (axis 1)
+                img_sbs = np.concatenate((img_left, img_right), axis=1) # Result: 3840x1080
+                
+                # Save PNG
+                frame_name = f"frame_{i:05d}.png"
+                frame_path = work_dir / frame_name
+                Image.fromarray(img_sbs).save(frame_path)
+                png_files.append(frame_path)
+
+                # Cleanup VRAM immediately
+                del gaussians, out_left, out_right, img_left, img_right, img_sbs, intrinsics, ext_left, ext_right
+                
+                # Aggressive memory management for long renders
+                if i % 5 == 0:
+                    torch.cuda.empty_cache()
+                    gc.collect()
+
+            except Exception as e:
+                LOGGER.error(f"Error processing SBS frame {i}: {e}")
+                # If we catch the compile error inside the loop, re-raise to stop job
+                if "cl" in str(e) or "DLL" in str(e) or "compiler" in str(e):
+                     raise RuntimeError("gsplat compilation failed. Install VS Build Tools or compatible wheels.")
+                continue
+
+            _active_jobs[job_id]['processed_frames'] = i + 1
+            if i % 10 == 0:
+                 LOGGER.info(f"Job {job_id}: SBS Rendered frame {i+1}")
+
+        # 4. Final Assembly (FFmpeg)
+        if len(png_files) > 0:
+            output_filename = f"{original_stem}_{unique_id}_SBS.mp4"
+            output_path = OUTPUT_DIR / output_filename
+            
+            LOGGER.info(f"Job {job_id}: Encoding SBS video...")
+            
+            # Input pattern for ffmpeg sequence
+            input_pattern = str(work_dir / "frame_%05d.png")
+            
+            # Construct FFmpeg command
+            # -framerate: set input fps
+            # -i pattern: input images
+            # -i audio: input audio (if exists)
+            # -c:v libx264: encoding
+            # -pix_fmt yuv420p: compatibility
+            # -shortest: finish when shortest stream ends (images usually)
+            
+            cmd = [
+                ffmpeg_exe, "-y",
+                "-framerate", str(fps),
+                "-i", input_pattern
+            ]
+            
+            if has_audio:
+                cmd.extend(["-i", str(audio_path)])
+            
+            cmd.extend([
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-crf", "18", # High quality
+                "-preset", "fast"
+            ])
+            
+            if has_audio:
+                # If we stopped early, -shortest handles trimming audio length
+                cmd.append("-shortest")
+            
+            cmd.append(str(output_path))
+            
+            try:
+                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                
+                # Register the final file in the job so frontend sees it
+                _active_jobs[job_id]['files'].append(output_filename)
+                
+                if not _active_jobs[job_id]['stop_signal']:
+                    _active_jobs[job_id]['status'] = 'done'
+                
+            except subprocess.CalledProcessError as e:
+                LOGGER.error(f"FFmpeg encoding failed: {e.stderr.decode()}")
+                _active_jobs[job_id]['status'] = 'error'
+                _active_jobs[job_id]['error_msg'] = "Video encoding failed."
+        else:
+             _active_jobs[job_id]['status'] = 'error'
+             _active_jobs[job_id]['error_msg'] = "No frames were processed successfully."
+
+    except Exception as e:
+        LOGGER.exception(f"Job {job_id} failed")
+        _active_jobs[job_id]['status'] = 'error'
+        _active_jobs[job_id]['error_msg'] = str(e)
+    finally:
+        if reader:
+            try: reader.close()
+            except: pass
+        if tmp_path.exists():
+            try: tmp_path.unlink()
+            except: pass
+        # Clean up work directory (PNGs and Audio)
+        if work_dir.exists():
+            try:
+                shutil.rmtree(work_dir)
+            except Exception as e:
+                LOGGER.warning(f"Failed to cleanup temp dir {work_dir}: {e}")
 
 
 @app.route("/generate_video", methods=["POST"])
@@ -423,7 +618,11 @@ def generate_video():
     # Get Quality/FP16 Setting for video
     quality = request.form.get('quality', 'balanced')
     use_fp16 = (quality == 'fast')
-    LOGGER.info(f"Starting video generation | Quality: {quality} | FP16: {use_fp16}")
+    
+    # Get Mode: 'ply_seq' (default) or 'sbs_movie'
+    output_mode = request.form.get('output_mode', 'ply_seq')
+    
+    LOGGER.info(f"Starting video generation | Quality: {quality} | Mode: {output_mode}")
 
     allowed_extensions = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
     ext = Path(file.filename).suffix.lower()
@@ -457,15 +656,22 @@ def generate_video():
             "processed_frames": 0,
             "stop_signal": False,
             "error_msg": "",
-            "fps": fps
+            "fps": fps,
+            "mode": output_mode
         }
 
         # Get model (ensure loaded)
         predictor, device = get_predictor()
+        
+        # Select worker based on mode
+        if output_mode == 'sbs_movie':
+            target_func = _process_sbs_video_job
+        else:
+            target_func = _process_video_job
 
         # Start thread
         thread = threading.Thread(
-            target=_process_video_job,
+            target=target_func,
             args=(job_id, tmp_path, original_stem, unique_id, predictor, device, fps, use_fp16)
         )
         thread.start()
@@ -495,7 +701,8 @@ def job_status(job_id):
         "files": job["files"], # Returns full list so client can see what's new
         "fps": job["fps"],
         "error": job["error_msg"],
-        "base_url": "/ply/"
+        "mode": job.get("mode", "ply_seq"),
+        "base_url": "/download/" if job.get("mode") == "sbs_movie" else "/ply/"
     })
 
 
@@ -596,16 +803,21 @@ def view_local():
 
 @app.route("/download/<filename>")
 def download(filename: str):
-    """Download a generated PLY file."""
+    """Download a generated file."""
     file_path = OUTPUT_DIR / filename
     if not file_path.exists():
         return jsonify({"error": "File not found"}), 404
+
+    # Determine mimetype based on extension
+    mime = "application/octet-stream"
+    if filename.endswith(".mp4"):
+        mime = "video/mp4"
 
     return send_file(
         file_path,
         as_attachment=True,
         download_name=filename,
-        mimetype="application/octet-stream",
+        mimetype=mime,
     )
 
 

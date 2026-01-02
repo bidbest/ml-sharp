@@ -237,6 +237,20 @@
         }
         .quality-select:focus { border-color: #00d4ff; }
         .quality-select option { background: #1a1a2e; }
+
+        .checkbox-container {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px;
+            background: rgba(0,0,0,0.2);
+            border-radius: 8px;
+            margin-bottom: 15px;
+        }
+        .checkbox-container input[type="checkbox"] {
+            transform: scale(1.2);
+            cursor: pointer;
+        }
     </style>
 </head>
 <body>
@@ -282,6 +296,17 @@
                         <img id="preview-image" src="" alt="Preview" style="display:none;">
                         <video id="preview-video" controls style="display:none;"></video>
                         <div class="preview-info" id="preview-info"></div>
+                        
+                        <!-- SBS Toggle for Video -->
+                        <div id="video-options" style="display:none; margin-top:10px;">
+                            <div class="checkbox-container">
+                                <input type="checkbox" id="sbs-toggle">
+                                <label for="sbs-toggle" style="cursor:pointer; color: #00d4ff;">Generate SBS 3D Movie (Requires CUDA)</label>
+                            </div>
+                            <small class="hint" style="display:block; margin-top:5px; color:#888;">
+                                Creates a 3840x1080 SBS video with audio. Slow processing.
+                            </small>
+                        </div>
                     </div>
 
                     <button class="generate-btn" id="generate-btn" disabled>
@@ -359,7 +384,7 @@
                         <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
                         </svg>
-                        Download PLY File
+                        Download File
                     </a>
                 </div>
 
@@ -501,6 +526,10 @@
         
         // Quality Selector
         const qualitySelector = document.getElementById('quality-selector');
+
+        // Video Options
+        const videoOptions = document.getElementById('video-options');
+        const sbsToggle = document.getElementById('sbs-toggle');
 
         // Webcam Elements
         const webcamFeed = document.getElementById('webcam-feed');
@@ -677,7 +706,25 @@
             previewContainer.classList.add('visible'); 
             showStatus("File selected: " + file.name, "info");
             
-            if (fileType.startsWith('image/')) { isVideoMode = false; previewImage.style.display = 'block'; previewVideo.style.display = 'none'; const reader = new FileReader(); reader.onload = (e) => { previewImage.src = e.target.result; }; reader.readAsDataURL(file); } else if (fileType.startsWith('video/')) { isVideoMode = true; previewImage.style.display = 'none'; previewVideo.style.display = 'block'; previewVideo.src = URL.createObjectURL(file); previewInfo.textContent = `${file.name} (Video)`; } generateBtn.disabled = false; generateBtn.querySelector('.btn-text').textContent = isVideoMode ? "Generate Video Splats" : "Generate 3D Gaussian Splat"; downloadSection.classList.remove('visible'); 
+            if (fileType.startsWith('image/')) { 
+                isVideoMode = false; 
+                videoOptions.style.display = 'none';
+                previewImage.style.display = 'block'; 
+                previewVideo.style.display = 'none'; 
+                const reader = new FileReader(); 
+                reader.onload = (e) => { previewImage.src = e.target.result; }; 
+                reader.readAsDataURL(file); 
+            } else if (fileType.startsWith('video/')) { 
+                isVideoMode = true; 
+                videoOptions.style.display = 'block';
+                previewImage.style.display = 'none'; 
+                previewVideo.style.display = 'block'; 
+                previewVideo.src = URL.createObjectURL(file); 
+                previewInfo.textContent = `${file.name} (Video)`; 
+            } 
+            generateBtn.disabled = false; 
+            generateBtn.querySelector('.btn-text').textContent = isVideoMode ? "Generate Video Splats" : "Generate 3D Gaussian Splat"; 
+            downloadSection.classList.remove('visible'); 
         }
 
         // Shared Generation Logic (Used by File Upload & Webcam)
@@ -697,6 +744,10 @@
                     // If generated from Webcam, update view URL but optionally keep camera pos
                     if (data.download_url) { 
                         downloadBtn.href = data.download_url; 
+                        downloadBtn.innerHTML = `
+                        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                        </svg> Download PLY File`;
                         downloadSection.classList.add('visible'); 
                     }
                     
@@ -729,8 +780,16 @@
                 const formData = new FormData();
                 formData.append('video', selectedFile);
                 formData.append('quality', qualitySelector.value); // Pass quality setting
+                
+                // Set Mode: SBS Movie vs PLY Sequence
+                if (sbsToggle.checked) {
+                    formData.append('output_mode', 'sbs_movie');
+                    showStatus('Starting SBS 3D Movie generation (Frames + Rendering)...', 'info');
+                } else {
+                    formData.append('output_mode', 'ply_seq');
+                    showStatus('Initializing video generation...', 'info');
+                }
 
-                showStatus('Initializing video generation...', 'info');
                 try {
                     const response = await fetch('/generate_video', { method: 'POST', body: formData });
                     const data = await response.json();
@@ -767,11 +826,19 @@
                     const res = await fetch(`/job_status/${jobId}`);
                     const data = await res.json();
                     if (res.status !== 200) { clearInterval(statusPollInterval); showStatus(data.error, 'error'); return; }
+                    
+                    const isSBS = (data.mode === 'sbs_movie');
                     const percent = data.total > 0 ? Math.round((data.processed / data.total) * 100) : 0;
                     progressBarFill.style.width = percent + '%';
-                    progressBarText.textContent = `Processing Frame ${data.processed} / ${data.total}`;
                     
-                    if (data.files.length > 0) {
+                    if (isSBS) {
+                        progressBarText.textContent = `Rendering SBS Movie: Frame ${data.processed} / ${data.total}`;
+                    } else {
+                        progressBarText.textContent = `Processing Frame ${data.processed} / ${data.total}`;
+                    }
+                    
+                    // Show progress in viewer if not SBS mode
+                    if (!isSBS && data.files.length > 0) {
                         const lastFile = data.files[data.files.length - 1];
                         const url = data.base_url + lastFile;
                         if (url !== lastLoadedFrameUrl) {
@@ -780,6 +847,7 @@
                             else viewer.loadPly(url, false);
                         }
                     }
+                    
                     if (data.status === 'done' || data.status === 'stopped' || data.status === 'error') {
                         clearInterval(statusPollInterval);
                         stopBtn.classList.remove('visible');
@@ -792,10 +860,26 @@
                         if (data.status === 'error') {
                             showStatus('Error: ' + data.error, 'error');
                         } else {
-                            // CHANGED: Do NOT auto-load results to prevent browser crash on large videos.
-                            // Just notify user they are done.
-                            const msg = data.status === 'stopped' ? 'Processing Stopped.' : 'Processing Complete!';
-                            showStatus(`${msg} Files saved to output folder. Use "Load Existing" to view specific frames.`, 'success');
+                            if (isSBS) {
+                                // For SBS, we have a single MP4 file
+                                const finalFile = data.files[data.files.length - 1];
+                                showStatus("SBS Movie Generated Successfully!", 'success');
+                                downloadBtn.href = `/download/${finalFile}`;
+                                downloadBtn.innerHTML = `
+                                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                                </svg> Download SBS Movie (MP4)`;
+                                downloadSection.classList.add('visible');
+                                
+                                // Reset UI
+                                document.querySelector('.mode-tabs').style.display = 'none';
+                                createView.style.display = 'none';
+                                resetAppBtn.style.display = 'flex';
+                                
+                            } else {
+                                const msg = data.status === 'stopped' ? 'Processing Stopped.' : 'Processing Complete!';
+                                showStatus(`${msg} Files saved to output folder. Use "Load Existing" to view specific frames.`, 'success');
+                            }
                         }
                     }
                 } catch (e) { console.error(e); }
