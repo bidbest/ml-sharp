@@ -18,8 +18,8 @@ You can create 3D clips of movies and fly inside! You are only limited by your c
 
 ![Star Trek](webui_static/ml-sharp-star-trek-1.gif)
 
-## Get Inside Your Favourite Movies Scenes
-Amazing tech from Apple works with any image. Visit the places you always wanted to see in 3D, from movies to historical events.
+## Get Inside Your Favorite Movies Scenes with Webcam and OBS Virtual Camera Support
+Amazing tech from Apple works with any image. You can even use OBS as a virtual camera and capture a live image and turn it into a 3D splat. Visit the places you always wanted to see in 3D, from movies to historical events.
 
 ![Star Wars](webui_static/ml-sharp-star-wars-1.gif)
 ![Star Wars](webui_static/ml-sharp-star-wars-2.gif)
