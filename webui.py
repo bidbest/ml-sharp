@@ -422,8 +422,10 @@ def _process_sbs_video_job(job_id, tmp_path, original_stem, unique_id, predictor
         render_w, render_h = 1920, 1080
         
         # Robust Renderer Initialization for Windows
+        # NOTE: Using 'linearRGB' triggers the library to convert Linear->sRGB (Gamma correct), which effectively brightens the image.
+        # Using 'sRGB' actually passes the raw Linear data which looks dark.
         try:
-            renderer = gsplat.GSplatRenderer(color_space="sRGB")
+            renderer = gsplat.GSplatRenderer(color_space="linearRGB")
         except Exception as e:
             err_str = str(e)
             if "DLL load failed" in err_str or "cl" in err_str or "compiler" in err_str.lower():
@@ -437,6 +439,9 @@ def _process_sbs_video_job(job_id, tmp_path, original_stem, unique_id, predictor
         # Base IPD offset approx 0.06 units total. 
         # Left eye: -0.03, Right eye: +0.03
         stereo_offset = 0.03 
+        
+        # Brightness Boost Factor (Simulates bright light / exposure)
+        brightness_factor = 1.2
 
         # 3. Frame Loop
         png_files = []
@@ -489,7 +494,9 @@ def _process_sbs_video_job(job_id, tmp_path, original_stem, unique_id, predictor
                     intrinsics=intrinsics.unsqueeze(0),
                     image_width=render_w, image_height=render_h
                 )
-                img_left = (out_left.color[0].permute(1, 2, 0).clamp(0, 1) * 255).byte().cpu().numpy()
+                # Apply brightness factor + clamp
+                img_left_tensor = (out_left.color[0] * brightness_factor).clamp(0, 1)
+                img_left = (img_left_tensor.permute(1, 2, 0) * 255).byte().cpu().numpy()
 
                 # Render Right
                 out_right = renderer(
@@ -498,7 +505,9 @@ def _process_sbs_video_job(job_id, tmp_path, original_stem, unique_id, predictor
                     intrinsics=intrinsics.unsqueeze(0),
                     image_width=render_w, image_height=render_h
                 )
-                img_right = (out_right.color[0].permute(1, 2, 0).clamp(0, 1) * 255).byte().cpu().numpy()
+                # Apply brightness factor + clamp
+                img_right_tensor = (out_right.color[0] * brightness_factor).clamp(0, 1)
+                img_right = (img_right_tensor.permute(1, 2, 0) * 255).byte().cpu().numpy()
 
                 # Stitch (Side-by-Side)
                 # Shape is (H, W, C). Concatenate along Width (axis 1)
@@ -511,7 +520,7 @@ def _process_sbs_video_job(job_id, tmp_path, original_stem, unique_id, predictor
                 png_files.append(frame_path)
 
                 # Cleanup VRAM immediately
-                del gaussians, out_left, out_right, img_left, img_right, img_sbs, intrinsics, ext_left, ext_right
+                del gaussians, out_left, out_right, img_left_tensor, img_right_tensor, img_left, img_right, img_sbs, intrinsics, ext_left, ext_right
                 
                 # Aggressive memory management for long renders
                 if i % 5 == 0:
