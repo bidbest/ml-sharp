@@ -79,6 +79,13 @@ The result is a standard `.mp4` file encoded in the industry-standard Side-by-Si
 *   **No special players required:** Play it in VLC, Windows Media Player, or directly inside your AR Glasses' native media player.
 *   **Universal Compatibility:** If your device supports 3D SBS mode, this movie will play perfectly with full depth and immersion.
 
+### click image to watch video [ml-sharp](https://youtu.be/egaik88v2WY?si=C4t7jL6CJ9JvdgX0)
+[![ml-sharp-3d-sbs-video](https://i.ytimg.com/vi/egaik88v2WY/maxresdefault.jpg)](https://youtu.be/egaik88v2WY?si=C4t7jL6CJ9JvdgX0)
+
+Here is the original WALKING NAVOTAS video. You can convert any video to 3D SBS
+
+[WALKING NAVOTAS CITY'S EXTREME SLUMS](https://youtu.be/emPqaeJsRBk?si=NAd1_dyP2DJx6s9C)
+
 
 ## Support
 If you find this app useful, consider buying me a coffee!
