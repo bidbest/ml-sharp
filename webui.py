@@ -1098,8 +1098,11 @@ def _process_multi_view_video_job(
                 )
             image_id_counter += 1
 
+        cached_extrinsics = None
+        cached_render_state = None
+
         def process_multi_view_batch(frames, indices):
-            nonlocal cameras_written
+            nonlocal cameras_written, cached_extrinsics, cached_render_state
             try:
                 clean_frames = []
                 for f in frames:
@@ -1153,24 +1156,33 @@ def _process_multi_view_video_job(
                     _active_jobs[job_id]['processed_frames'] += 1
                     append_colmap_image(identity_extrinsics, source_camera_id, f"camera_00/{frame_name}")
 
+                render_state = (render_w, render_h, float(f_px_render))
+                if cached_extrinsics is None or cached_render_state != render_state:
+                    cached_render_state = render_state
+                    cached_extrinsics = []
+                    reference_gaussians = gaussians_list[0]
+                    for yaw, pitch in angle_pairs:
+                        cached_extrinsics.append(
+                            _build_orbit_extrinsics(
+                                yaw,
+                                pitch,
+                                intrinsics,
+                                render_w,
+                                render_h,
+                                reference_gaussians,
+                                renderer,
+                                device,
+                                orbit_radius=orbit_radius,
+                                distance_factor=distance_factor,
+                            )
+                        )
+
                 for k, gaussians in enumerate(gaussians_list):
                     idx = indices[k]
-                    for view_idx, (yaw, pitch) in enumerate(angle_pairs):
+                    for view_idx, extrinsics in enumerate(cached_extrinsics):
                         if _active_jobs[job_id]['stop_signal']:
                             return False
 
-                        extrinsics = _build_orbit_extrinsics(
-                            yaw,
-                            pitch,
-                            intrinsics,
-                            render_w,
-                            render_h,
-                            gaussians,
-                            renderer,
-                            device,
-                            orbit_radius=orbit_radius,
-                            distance_factor=distance_factor,
-                        )
                         output = renderer(
                             gaussians,
                             extrinsics=extrinsics.unsqueeze(0),
@@ -1270,7 +1282,7 @@ def _process_multi_view_images_job(
     batch_size,
     match_source_resolution,
 ):
-    """Background worker for multi-view image rendering using per-frame pose estimation."""
+    """Background worker for multi-view image rendering with a fixed pose from the first frame."""
     if device.type != 'cuda':
         _active_jobs[job_id]['status'] = 'error'
         _active_jobs[job_id]['error_msg'] = "Multi-view rendering requires a CUDA GPU."
@@ -1354,8 +1366,11 @@ def _process_multi_view_images_job(
                 )
             image_id_counter += 1
 
+        cached_extrinsics = None
+        cached_render_state = None
+
         def process_multi_view_batch(frames, indices):
-            nonlocal cameras_written
+            nonlocal cameras_written, cached_extrinsics, cached_render_state
             try:
                 clean_frames = []
                 for f in frames:
@@ -1409,24 +1424,33 @@ def _process_multi_view_images_job(
                     _active_jobs[job_id]['processed_frames'] += 1
                     append_colmap_image(identity_extrinsics, source_camera_id, f"camera_00/{frame_name}")
 
+                render_state = (render_w, render_h, float(f_px_render))
+                if cached_extrinsics is None or cached_render_state != render_state:
+                    cached_render_state = render_state
+                    cached_extrinsics = []
+                    reference_gaussians = gaussians_list[0]
+                    for yaw, pitch in angle_pairs:
+                        cached_extrinsics.append(
+                            _build_orbit_extrinsics(
+                                yaw,
+                                pitch,
+                                intrinsics,
+                                render_w,
+                                render_h,
+                                reference_gaussians,
+                                renderer,
+                                device,
+                                orbit_radius=orbit_radius,
+                                distance_factor=distance_factor,
+                            )
+                        )
+
                 for k, gaussians in enumerate(gaussians_list):
                     idx = indices[k]
-                    for view_idx, (yaw, pitch) in enumerate(angle_pairs):
+                    for view_idx, extrinsics in enumerate(cached_extrinsics):
                         if _active_jobs[job_id]['stop_signal']:
                             return False
 
-                        extrinsics = _build_orbit_extrinsics(
-                            yaw,
-                            pitch,
-                            intrinsics,
-                            render_w,
-                            render_h,
-                            gaussians,
-                            renderer,
-                            device,
-                            orbit_radius=orbit_radius,
-                            distance_factor=distance_factor,
-                        )
                         output = renderer(
                             gaussians,
                             extrinsics=extrinsics.unsqueeze(0),
