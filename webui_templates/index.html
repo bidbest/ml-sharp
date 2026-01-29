@@ -1033,6 +1033,13 @@
                                 </div>
 
                                 <div class="input-group" style="margin-bottom: 8px;">
+                                    <label>Project Name (Output Folder):</label>
+                                    <input type="text" id="multi-view-project-name" class="text-input"
+                                        placeholder="my_project">
+                                    <small class="hint">Creates a root folder with this name in the output directory.</small>
+                                </div>
+
+                                <div class="input-group" style="margin-bottom: 8px;">
                                     <label>Distance Multiplier:</label>
                                     <input type="number" id="multi-view-distance" class="text-input" step="0.05"
                                         min="0.05" value="1">
@@ -1363,6 +1370,7 @@
         const multiViewDistance = document.getElementById('multi-view-distance');
         const multiViewRadius = document.getElementById('multi-view-radius');
         const multiViewMatchSource = document.getElementById('multi-view-match-source');
+        const multiViewProjectName = document.getElementById('multi-view-project-name');
         const multiViewAngleList = document.getElementById('multi-view-angle-list');
         const multiViewYawStart = document.getElementById('multi-view-yaw-start');
         const multiViewYawEnd = document.getElementById('multi-view-yaw-end');
@@ -1937,6 +1945,9 @@
 
                     if (multiViewMatchSource && multiViewMatchSource.checked) {
                         formData.append('multi_view_match_source', 'on');
+                    }
+                    if (multiViewProjectName && multiViewProjectName.value.trim()) {
+                        formData.append('project_name', multiViewProjectName.value.trim());
                     }
                     formData.append('angle_list', multiViewAngleList.value);
                     formData.append('yaw_start', multiViewYawStart.value);
