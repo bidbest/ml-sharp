@@ -280,6 +280,15 @@ def _parse_multi_view_distance(form: dict) -> float:
     return distance
 
 
+
+def _parse_multi_view_radius(form: dict) -> float:
+    """Parse the multi-view orbit radius from form data."""
+    radius_raw = str(form.get("view_radius", "")).strip()
+    radius = float(radius_raw) if radius_raw else 1.0
+    if radius <= 0:
+        raise ValueError("Multi-view radius must be greater than 0.")
+    return radius
+
 def _parse_multi_view_match_source_resolution(form: dict) -> bool:
     """Parse whether multi-view rendering should match the source resolution."""
     value = str(form.get("multi_view_match_source", "")).strip().lower()
@@ -435,6 +444,7 @@ def _build_orbit_extrinsics(
     gaussians: Gaussians3D,
     renderer: gsplat.GSplatRenderer,
     device: torch.device,
+    orbit_radius: float = 1.0,
     distance_factor: float = 1.0,
 ) -> torch.Tensor:
     """Create camera extrinsics by orbiting around the depth center in OpenCV axes.
@@ -481,36 +491,20 @@ def _build_orbit_extrinsics(
         dim=0,
     )
 
-    orbit_radius = torch.clamp(center_depth * distance_factor, min=1e-4)
-    base_offset = torch.tensor([0.0, 0.0, -orbit_radius], device=device)
-
     yaw_rad = torch.deg2rad(torch.tensor(yaw_deg, device=device))
     pitch_rad = torch.deg2rad(torch.tensor(pitch_deg, device=device))
 
-    cos_yaw = torch.cos(yaw_rad)
-    sin_yaw = torch.sin(yaw_rad)
-    cos_pitch = torch.cos(pitch_rad)
-    sin_pitch = torch.sin(pitch_rad)
-
-    zero = torch.tensor(0.0, device=device)
-    one = torch.tensor(1.0, device=device)
-    yaw_matrix = torch.stack(
+    scaled_radius = max(orbit_radius * distance_factor, 1e-4)
+    radius_tensor = torch.tensor(scaled_radius, device=device, dtype=torch.float32)
+    offset = torch.stack(
         [
-            torch.stack([cos_yaw, zero, -sin_yaw]),
-            torch.stack([zero, one, zero]),
-            torch.stack([sin_yaw, zero, cos_yaw]),
-        ]
-    )
-    pitch_matrix = torch.stack(
-        [
-            torch.stack([one, zero, zero]),
-            torch.stack([zero, cos_pitch, -sin_pitch]),
-            torch.stack([zero, sin_pitch, cos_pitch]),
-        ]
-    )
-
-    rotated_offset = pitch_matrix @ (yaw_matrix @ base_offset)
-    camera_position = center_point + rotated_offset
+            torch.sin(yaw_rad) * torch.cos(pitch_rad),
+            torch.sin(pitch_rad),
+            -torch.cos(yaw_rad) * torch.cos(pitch_rad),
+        ],
+        dim=0,
+    ) * radius_tensor
+    camera_position = center_point + offset
     world_up = torch.tensor([0.0, -1.0, 0.0], device=device)
 
     return camera.create_camera_matrix(
@@ -975,6 +969,7 @@ def _process_multi_view_video_job(
     fps,
     use_fp16,
     angle_pairs,
+    orbit_radius,
     distance_factor,
     batch_size,
     match_source_resolution,
@@ -994,6 +989,7 @@ def _process_multi_view_video_job(
         json.dump(
             {
                 "distance_factor": distance_factor,
+                "orbit_radius": orbit_radius,
                 "views": [
                     {"index": idx, "yaw": yaw, "pitch": pitch}
                     for idx, (yaw, pitch) in enumerate(angle_pairs)
@@ -1020,9 +1016,6 @@ def _process_multi_view_video_job(
 
         base_render_w, base_render_h = 1920, 1080
         renderer = gsplat.GSplatRenderer(color_space="linearRGB")
-        extrinsics_list = _build_view_extrinsics_from_angles(
-            angle_pairs, device, distance_factor=distance_factor
-        )
 
         batch_frames = []
         batch_indices = []
@@ -1052,10 +1045,22 @@ def _process_multi_view_video_job(
 
                 for k, gaussians in enumerate(gaussians_list):
                     idx = indices[k]
-                    for view_idx, extrinsics in enumerate(extrinsics_list):
+                    for view_idx, (yaw, pitch) in enumerate(angle_pairs):
                         if _active_jobs[job_id]['stop_signal']:
                             return False
 
+                        extrinsics = _build_orbit_extrinsics(
+                            yaw,
+                            pitch,
+                            intrinsics,
+                            render_w,
+                            render_h,
+                            gaussians,
+                            renderer,
+                            device,
+                            orbit_radius=orbit_radius,
+                            distance_factor=distance_factor,
+                        )
                         output = renderer(
                             gaussians,
                             extrinsics=extrinsics.unsqueeze(0),
@@ -1145,6 +1150,7 @@ def _process_multi_view_images_job(
     fps,
     use_fp16,
     angle_pairs,
+    orbit_radius,
     distance_factor,
     batch_size,
     match_source_resolution,
@@ -1164,6 +1170,7 @@ def _process_multi_view_images_job(
         json.dump(
             {
                 "distance_factor": distance_factor,
+                "orbit_radius": orbit_radius,
                 "views": [
                     {"index": idx, "yaw": yaw, "pitch": pitch}
                     for idx, (yaw, pitch) in enumerate(angle_pairs)
@@ -1234,6 +1241,7 @@ def _process_multi_view_images_job(
                             gaussians,
                             renderer,
                             device,
+                            orbit_radius=orbit_radius,
                             distance_factor=distance_factor,
                         )
                         output = renderer(
@@ -1486,6 +1494,7 @@ def preview_multi_view_frame():
 
     try:
         angle_pairs, _ = _parse_multi_view_angles(request.form)
+        orbit_radius = _parse_multi_view_radius(request.form)
         distance_factor = _parse_multi_view_distance(request.form)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
@@ -1533,12 +1542,20 @@ def preview_multi_view_frame():
             [0, 0, 0, 1],
         ], device=device, dtype=torch.float32)
 
-        extrinsics_list = _build_view_extrinsics_from_angles(
-            angle_pairs, device, distance_factor=distance_factor
-        )
-
         rendered_images = []
-        for extrinsics in extrinsics_list:
+        for yaw, pitch in angle_pairs:
+            extrinsics = _build_orbit_extrinsics(
+                yaw,
+                pitch,
+                intrinsics,
+                render_w,
+                render_h,
+                gaussians,
+                renderer,
+                device,
+                orbit_radius=orbit_radius,
+                distance_factor=distance_factor,
+            )
             output = renderer(
                 gaussians,
                 extrinsics=extrinsics.unsqueeze(0),
@@ -1614,6 +1631,7 @@ def generate_video():
     stereo_offset = float(request.form.get('stereo_offset', 0.015))
     brightness_factor = float(request.form.get('brightness_factor', 1.0))
     angle_pairs = None
+    orbit_radius = 1.0
     distance_factor = 1.0
     match_source_resolution = False
     
@@ -1627,6 +1645,7 @@ def generate_video():
     if output_mode in {'multi_view_frames', 'multi_view'}:
         try:
             angle_pairs, num_views = _parse_multi_view_angles(request.form)
+            orbit_radius = _parse_multi_view_radius(request.form)
             distance_factor = _parse_multi_view_distance(request.form)
             match_source_resolution = _parse_multi_view_match_source_resolution(request.form)
         except ValueError as exc:
@@ -1688,6 +1707,7 @@ def generate_video():
                     fps,
                     use_fp16,
                     angle_pairs,
+                    orbit_radius,
                     distance_factor,
                     batch_size,
                     match_source_resolution,
@@ -1706,6 +1726,7 @@ def generate_video():
                     fps,
                     use_fp16,
                     angle_pairs,
+                    orbit_radius,
                     distance_factor,
                     batch_size,
                     match_source_resolution,
