@@ -271,16 +271,27 @@ def _parse_multi_view_angles(form: dict) -> tuple[list[tuple[float, float]], int
     return normalized_pairs, num_views or len(normalized_pairs)
 
 
+def _parse_multi_view_distance(form: dict) -> float:
+    """Parse the multi-view distance multiplier from form data."""
+    distance_raw = str(form.get("view_distance", "")).strip()
+    distance = float(distance_raw) if distance_raw else 1.0
+    if distance <= 0:
+        raise ValueError("Multi-view distance must be greater than 0.")
+    return distance
+
+
 def _build_view_extrinsics_from_angles(
     angle_pairs: list[tuple[float, float]],
     device: torch.device,
     radius: float = 3.0,
+    distance_factor: float = 1.0,
 ) -> list[torch.Tensor]:
     """Create extrinsics matrices for yaw/pitch camera angles relative to the default view."""
     look_at = torch.zeros(3, device=device)
     world_up = torch.tensor([0.0, -1.0, 0.0], device=device)
     extrinsics_list = []
-    base_offset = torch.tensor([0.0, 0.0, -radius], device=device, dtype=torch.float32)
+    scaled_radius = max(radius * distance_factor, 1e-4)
+    base_offset = torch.tensor([0.0, 0.0, -scaled_radius], device=device, dtype=torch.float32)
 
     for yaw, pitch in angle_pairs:
         yaw_rad = math.radians(yaw)
@@ -418,6 +429,7 @@ def _build_orbit_extrinsics(
     gaussians: Gaussians3D,
     renderer: gsplat.GSplatRenderer,
     device: torch.device,
+    distance_factor: float = 1.0,
 ) -> torch.Tensor:
     """Create camera extrinsics by orbiting around the depth center in OpenCV axes.
 
@@ -463,7 +475,7 @@ def _build_orbit_extrinsics(
         dim=0,
     )
 
-    orbit_radius = torch.clamp(center_depth, min=1e-4)
+    orbit_radius = torch.clamp(center_depth * distance_factor, min=1e-4)
     base_offset = torch.tensor([0.0, 0.0, -orbit_radius], device=device)
 
     yaw_rad = torch.deg2rad(torch.tensor(yaw_deg, device=device))
@@ -957,6 +969,7 @@ def _process_multi_view_video_job(
     fps,
     use_fp16,
     angle_pairs,
+    distance_factor,
     batch_size,
 ):
     """Background worker for multi-view frame rendering."""
@@ -972,7 +985,13 @@ def _process_multi_view_video_job(
     angles_path = work_dir / "view_angles.json"
     with angles_path.open("w", encoding="utf-8") as angles_file:
         json.dump(
-            {"views": [{"index": idx, "yaw": yaw, "pitch": pitch} for idx, (yaw, pitch) in enumerate(angle_pairs)]},
+            {
+                "distance_factor": distance_factor,
+                "views": [
+                    {"index": idx, "yaw": yaw, "pitch": pitch}
+                    for idx, (yaw, pitch) in enumerate(angle_pairs)
+                ],
+            },
             angles_file,
             indent=2,
         )
@@ -994,7 +1013,9 @@ def _process_multi_view_video_job(
 
         render_w, render_h = 1280, 720
         renderer = gsplat.GSplatRenderer(color_space="linearRGB")
-        extrinsics_list = _build_view_extrinsics_from_angles(angle_pairs, device)
+        extrinsics_list = _build_view_extrinsics_from_angles(
+            angle_pairs, device, distance_factor=distance_factor
+        )
 
         batch_frames = []
         batch_indices = []
@@ -1116,6 +1137,7 @@ def _process_multi_view_images_job(
     fps,
     use_fp16,
     angle_pairs,
+    distance_factor,
     batch_size,
 ):
     """Background worker for multi-view image rendering using per-frame pose estimation."""
@@ -1131,7 +1153,13 @@ def _process_multi_view_images_job(
     angles_path = work_dir / "view_angles.json"
     with angles_path.open("w", encoding="utf-8") as angles_file:
         json.dump(
-            {"views": [{"index": idx, "yaw": yaw, "pitch": pitch} for idx, (yaw, pitch) in enumerate(angle_pairs)]},
+            {
+                "distance_factor": distance_factor,
+                "views": [
+                    {"index": idx, "yaw": yaw, "pitch": pitch}
+                    for idx, (yaw, pitch) in enumerate(angle_pairs)
+                ],
+            },
             angles_file,
             indent=2,
         )
@@ -1196,6 +1224,7 @@ def _process_multi_view_images_job(
                             gaussians,
                             renderer,
                             device,
+                            distance_factor=distance_factor,
                         )
                         output = renderer(
                             gaussians,
@@ -1447,6 +1476,7 @@ def preview_multi_view_frame():
 
     try:
         angle_pairs, _ = _parse_multi_view_angles(request.form)
+        distance_factor = _parse_multi_view_distance(request.form)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
@@ -1493,7 +1523,9 @@ def preview_multi_view_frame():
             [0, 0, 0, 1],
         ], device=device, dtype=torch.float32)
 
-        extrinsics_list = _build_view_extrinsics_from_angles(angle_pairs, device)
+        extrinsics_list = _build_view_extrinsics_from_angles(
+            angle_pairs, device, distance_factor=distance_factor
+        )
 
         rendered_images = []
         for extrinsics in extrinsics_list:
@@ -1572,6 +1604,7 @@ def generate_video():
     stereo_offset = float(request.form.get('stereo_offset', 0.015))
     brightness_factor = float(request.form.get('brightness_factor', 1.0))
     angle_pairs = None
+    distance_factor = 1.0
     
     # BATCH SIZE parsing
     try:
@@ -1583,6 +1616,7 @@ def generate_video():
     if output_mode in {'multi_view_frames', 'multi_view'}:
         try:
             angle_pairs, num_views = _parse_multi_view_angles(request.form)
+            distance_factor = _parse_multi_view_distance(request.form)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         LOGGER.info(f"Multi-view rendering with {num_views} views.")
@@ -1632,12 +1666,36 @@ def generate_video():
         elif output_mode == 'multi_view_frames':
             thread = threading.Thread(
                 target=_process_multi_view_video_job,
-                args=(job_id, tmp_path, original_stem, unique_id, predictor, device, fps, use_fp16, angle_pairs, batch_size)
+                args=(
+                    job_id,
+                    tmp_path,
+                    original_stem,
+                    unique_id,
+                    predictor,
+                    device,
+                    fps,
+                    use_fp16,
+                    angle_pairs,
+                    distance_factor,
+                    batch_size,
+                )
             )
         elif output_mode == 'multi_view':
             thread = threading.Thread(
                 target=_process_multi_view_images_job,
-                args=(job_id, tmp_path, original_stem, unique_id, predictor, device, fps, use_fp16, angle_pairs, batch_size)
+                args=(
+                    job_id,
+                    tmp_path,
+                    original_stem,
+                    unique_id,
+                    predictor,
+                    device,
+                    fps,
+                    use_fp16,
+                    angle_pairs,
+                    distance_factor,
+                    batch_size,
+                )
             )
         else:
             thread = threading.Thread(
