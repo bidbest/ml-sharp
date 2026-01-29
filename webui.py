@@ -15,6 +15,9 @@ import shutil
 import threading
 import time
 import gc
+import json
+import math
+import re
 from pathlib import Path
 import urllib.parse
 import traceback
@@ -195,6 +198,107 @@ def get_next_job_prefix() -> str:
     except Exception as e:
         LOGGER.error(f"Error calculating job prefix: {e}")
         return "000"
+
+
+def _normalize_yaw_pitch(yaw: float, pitch: float) -> tuple[float, float]:
+    """Normalize yaw to [-180, 180) and clamp pitch to [-89, 89]."""
+    normalized_yaw = ((yaw + 180.0) % 360.0) - 180.0
+    clamped_pitch = max(min(pitch, 89.0), -89.0)
+    return normalized_yaw, clamped_pitch
+
+
+def _frange(start: float, end: float, step: float) -> list[float]:
+    """Floating range that includes the end value."""
+    if step == 0:
+        raise ValueError("Step must be non-zero.")
+    values = []
+    current = start
+    if step > 0:
+        while current <= end + 1e-9:
+            values.append(current)
+            current += step
+    else:
+        while current >= end - 1e-9:
+            values.append(current)
+            current += step
+    return values
+
+
+def _parse_angle_pairs(angle_list: str) -> list[tuple[float, float]]:
+    """Parse yaw/pitch pairs from a CSV list."""
+    pairs = []
+    entries = re.split(r"[;\n]+", angle_list.strip())
+    for entry in entries:
+        if not entry.strip():
+            continue
+        parts = [p for p in re.split(r"[,\s]+", entry.strip()) if p]
+        if len(parts) != 2:
+            raise ValueError(f"Invalid angle pair: '{entry}'. Expected 'yaw,pitch'.")
+        pairs.append((float(parts[0]), float(parts[1])))
+    return pairs
+
+
+def _parse_multi_view_angles(form: dict) -> tuple[list[tuple[float, float]], int]:
+    """Parse multi-view angle settings from form data."""
+    num_views_raw = str(form.get("num_views", "")).strip()
+    num_views = int(num_views_raw) if num_views_raw else 0
+    angle_list = str(form.get("angle_list", "")).strip()
+
+    if angle_list:
+        pairs = _parse_angle_pairs(angle_list)
+    else:
+        yaw_start = float(form.get("yaw_start", -30))
+        yaw_end = float(form.get("yaw_end", 30))
+        yaw_step = float(form.get("yaw_step", 15))
+        pitch_start = float(form.get("pitch_start", 0))
+        pitch_end = float(form.get("pitch_end", 0))
+        pitch_step = float(form.get("pitch_step", 15))
+
+        yaw_values = _frange(yaw_start, yaw_end, yaw_step)
+        pitch_values = _frange(pitch_start, pitch_end, pitch_step)
+        pairs = [(yaw, pitch) for pitch in pitch_values for yaw in yaw_values]
+
+    if not pairs:
+        raise ValueError("No angle pairs provided for multi-view rendering.")
+
+    normalized_pairs = [_normalize_yaw_pitch(yaw, pitch) for yaw, pitch in pairs]
+
+    if num_views and len(normalized_pairs) != num_views:
+        raise ValueError(
+            f"Expected {num_views} angle pairs but got {len(normalized_pairs)}."
+        )
+
+    return normalized_pairs, num_views or len(normalized_pairs)
+
+
+def _build_view_extrinsics(
+    angle_pairs: list[tuple[float, float]],
+    device: torch.device,
+    radius: float = 3.0,
+) -> list[torch.Tensor]:
+    """Create extrinsics matrices for yaw/pitch camera angles."""
+    look_at = torch.zeros(3, device=device)
+    world_up = torch.tensor([0.0, 0.0, 1.0], device=device)
+    extrinsics_list = []
+
+    for yaw, pitch in angle_pairs:
+        yaw_rad = math.radians(yaw)
+        pitch_rad = math.radians(pitch)
+        position = torch.tensor(
+            [
+                radius * math.cos(pitch_rad) * math.cos(yaw_rad),
+                radius * math.cos(pitch_rad) * math.sin(yaw_rad),
+                radius * math.sin(pitch_rad),
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        extrinsics = camera.create_camera_matrix(
+            position, look_at_position=look_at, world_up=world_up, inverse=True
+        )
+        extrinsics_list.append(extrinsics)
+
+    return extrinsics_list
 
 
 @torch.no_grad()
@@ -730,6 +834,165 @@ def _process_sbs_video_job(job_id, tmp_path, original_stem, unique_id, predictor
         # if work_dir.exists(): try: shutil.rmtree(work_dir) except: pass
 
 
+def _process_multi_view_video_job(
+    job_id,
+    tmp_path,
+    original_stem,
+    unique_id,
+    predictor,
+    device,
+    fps,
+    use_fp16,
+    angle_pairs,
+    batch_size,
+):
+    """Background worker for multi-view frame rendering."""
+    if device.type != 'cuda':
+        _active_jobs[job_id]['status'] = 'error'
+        _active_jobs[job_id]['error_msg'] = "Multi-view rendering requires a CUDA GPU."
+        return
+
+    job_prefix = get_next_job_prefix()
+    work_dir = OUTPUT_DIR / f"{job_prefix}_{original_stem}_multiview"
+    work_dir.mkdir(exist_ok=True)
+
+    angles_path = work_dir / "view_angles.json"
+    with angles_path.open("w", encoding="utf-8") as angles_file:
+        json.dump(
+            {"views": [{"index": idx, "yaw": yaw, "pitch": pitch} for idx, (yaw, pitch) in enumerate(angle_pairs)]},
+            angles_file,
+            indent=2,
+        )
+
+    LOGGER.info(f"Job {job_id} [{job_prefix}] | Batch: {batch_size} | Views: {len(angle_pairs)} | Folder: {work_dir}")
+
+    reader = None
+    try:
+        total_frames = 0
+        try:
+            reader = iio.get_reader(tmp_path)
+            total_frames = reader.count_frames()
+            total_views = total_frames * len(angle_pairs)
+            _active_jobs[job_id]['total_frames'] = total_views
+        except Exception:
+            _active_jobs[job_id]['total_frames'] = 0
+            if reader is None:
+                reader = iio.get_reader(tmp_path)
+
+        render_w, render_h = 1280, 720
+        renderer = gsplat.GSplatRenderer(color_space="linearRGB")
+        extrinsics_list = _build_view_extrinsics(angle_pairs, device)
+
+        batch_frames = []
+        batch_indices = []
+
+        def process_multi_view_batch(frames, indices):
+            try:
+                clean_frames = []
+                for f in frames:
+                    if f.shape[2] > 3:
+                        clean_frames.append(f[:, :, :3])
+                    else:
+                        clean_frames.append(f)
+
+                h, w = clean_frames[0].shape[:2]
+                f_px = io.convert_focallength(w, h, 30.0)
+
+                gaussians_list = predict_batch(predictor, clean_frames, f_px, device, use_fp16=use_fp16)
+
+                f_px_render = f_px * (render_w / w)
+                intrinsics = torch.tensor([
+                    [f_px_render, 0, render_w / 2, 0],
+                    [0, f_px_render, render_h / 2, 0],
+                    [0, 0, 1, 0],
+                    [0, 0, 0, 1],
+                ], device=device, dtype=torch.float32)
+
+                for k, gaussians in enumerate(gaussians_list):
+                    idx = indices[k]
+                    for view_idx, extrinsics in enumerate(extrinsics_list):
+                        if _active_jobs[job_id]['stop_signal']:
+                            return False
+
+                        output = renderer(
+                            gaussians,
+                            extrinsics=extrinsics.unsqueeze(0),
+                            intrinsics=intrinsics.unsqueeze(0),
+                            image_width=render_w,
+                            image_height=render_h,
+                        )
+                        img_tensor = output.color[0].clamp(0, 1)
+                        img = (img_tensor.permute(1, 2, 0) * 255).byte().cpu().numpy()
+
+                        frame_name = f"frame_{idx:05d}_view_{view_idx:02d}.png"
+                        frame_path = work_dir / frame_name
+                        Image.fromarray(img).save(frame_path)
+
+                        relative_path = f"{work_dir.name}/{frame_name}"
+                        _active_jobs[job_id]['files'].append(relative_path)
+                        _active_jobs[job_id]['processed_frames'] += 1
+
+                        del output, img_tensor, img
+
+                    del gaussians
+
+                torch.cuda.empty_cache()
+                gc.collect()
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() and len(frames) > 1:
+                    LOGGER.warning(f"OOM in multi-view job with batch {len(frames)}. Switching to 1.")
+                    torch.cuda.empty_cache()
+                    for idx, single_frame in enumerate(frames):
+                        process_multi_view_batch([single_frame], [indices[idx]])
+                    return True
+                raise e
+            return False
+
+        fallback_mode = False
+
+        for i, frame in enumerate(reader):
+            if _active_jobs[job_id]['stop_signal']:
+                LOGGER.info(f"Job {job_id} stopped by user.")
+                _active_jobs[job_id]['status'] = 'stopped'
+                break
+
+            batch_frames.append(frame)
+            batch_indices.append(i)
+
+            effective_bs = 1 if fallback_mode else batch_size
+            if len(batch_frames) >= effective_bs:
+                oom = process_multi_view_batch(batch_frames, batch_indices)
+                if oom:
+                    fallback_mode = True
+                batch_frames = []
+                batch_indices = []
+
+            if i % 10 == 0:
+                LOGGER.info(f"Job {job_id}: Rendered frame {i + 1}")
+
+        if batch_frames and not _active_jobs[job_id]['stop_signal']:
+            process_multi_view_batch(batch_frames, batch_indices)
+
+        if not _active_jobs[job_id]['stop_signal']:
+            _active_jobs[job_id]['status'] = 'done'
+
+    except Exception as e:
+        LOGGER.exception(f"Job {job_id} failed")
+        _active_jobs[job_id]['status'] = 'error'
+        _active_jobs[job_id]['error_msg'] = str(e)
+    finally:
+        if reader:
+            try:
+                reader.close()
+            except:
+                pass
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except:
+                pass
+
+
 @app.route("/preview_sbs_frame", methods=["POST"])
 def preview_sbs_frame():
     """Generate a single SBS preview frame from a video for testing settings."""
@@ -881,6 +1144,133 @@ def preview_sbs_frame():
                 pass
 
 
+@app.route("/preview_multi_view_frame", methods=["POST"])
+def preview_multi_view_frame():
+    """Generate a multi-view preview grid from a video frame."""
+    if "video" not in request.files:
+        return jsonify({"error": "No video file provided"}), 400
+
+    file = request.files["video"]
+    if file.filename == "":
+        return jsonify({"error": "No file selected"}), 400
+
+    try:
+        frame_number = int(request.form.get('frame_number', 0))
+    except ValueError:
+        frame_number = 0
+
+    quality = request.form.get('quality', 'balanced')
+    use_fp16 = (quality == 'fast')
+
+    try:
+        angle_pairs, _ = _parse_multi_view_angles(request.form)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    allowed_extensions = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+    ext = Path(file.filename).suffix.lower()
+    if ext not in allowed_extensions:
+        return jsonify({"error": f"Unsupported file type: {ext}"}), 400
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            file.save(tmp.name)
+            tmp_path = Path(tmp.name)
+
+        predictor, device = get_predictor()
+
+        if device.type != 'cuda':
+            return jsonify({"error": "Multi-view preview requires a CUDA GPU."}), 400
+
+        reader = iio.get_reader(tmp_path)
+        try:
+            frame = reader.get_data(frame_number)
+        except IndexError:
+            reader.close()
+            return jsonify({"error": f"Frame {frame_number} out of range"}), 400
+        reader.close()
+
+        if frame.shape[2] > 3:
+            frame = frame[:, :, :3]
+
+        h, w = frame.shape[:2]
+        f_px = io.convert_focallength(w, h, 30.0)
+
+        gaussians = predict_image(predictor, frame, f_px, device, use_fp16=use_fp16)
+
+        render_w, render_h = 640, 360
+        renderer = gsplat.GSplatRenderer(color_space="linearRGB")
+
+        f_px_render = f_px * (render_w / w)
+        intrinsics = torch.tensor([
+            [f_px_render, 0, render_w / 2, 0],
+            [0, f_px_render, render_h / 2, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ], device=device, dtype=torch.float32)
+
+        extrinsics_list = _build_view_extrinsics(angle_pairs, device)
+
+        rendered_images = []
+        for extrinsics in extrinsics_list:
+            output = renderer(
+                gaussians,
+                extrinsics=extrinsics.unsqueeze(0),
+                intrinsics=intrinsics.unsqueeze(0),
+                image_width=render_w,
+                image_height=render_h,
+            )
+            img_tensor = output.color[0].clamp(0, 1)
+            img = (img_tensor.permute(1, 2, 0) * 255).byte().cpu().numpy()
+            rendered_images.append(img)
+            del output, img_tensor
+
+        cols = math.ceil(math.sqrt(len(rendered_images)))
+        rows = math.ceil(len(rendered_images) / cols)
+        grid = np.zeros((rows * render_h, cols * render_w, 3), dtype=np.uint8)
+
+        for idx, img in enumerate(rendered_images):
+            row = idx // cols
+            col = idx % cols
+            y0 = row * render_h
+            x0 = col * render_w
+            grid[y0:y0 + render_h, x0:x0 + render_w] = img
+
+        del gaussians
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as out_tmp:
+            Image.fromarray(grid).save(out_tmp.name, "JPEG", quality=90)
+            out_tmp_path = Path(out_tmp.name)
+
+        response = send_file(
+            out_tmp_path,
+            mimetype='image/jpeg',
+            as_attachment=False
+        )
+
+        @response.call_on_close
+        def cleanup():
+            try:
+                out_tmp_path.unlink()
+            except:
+                pass
+
+        return response
+
+    except Exception as e:
+        LOGGER.exception("Error generating multi-view preview")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if tmp_path and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except:
+                pass
+
+
 @app.route("/generate_video", methods=["POST"])
 def generate_video():
     """Start async video generation."""
@@ -898,6 +1288,7 @@ def generate_video():
     opacity_threshold = float(request.form.get('opacity_threshold', 0.0))
     stereo_offset = float(request.form.get('stereo_offset', 0.015))
     brightness_factor = float(request.form.get('brightness_factor', 1.0))
+    angle_pairs = None
     
     # BATCH SIZE parsing
     try:
@@ -905,6 +1296,13 @@ def generate_video():
         if batch_size < 1: batch_size = 1
     except:
         batch_size = 1
+
+    if output_mode == 'multi_view_frames':
+        try:
+            angle_pairs, num_views = _parse_multi_view_angles(request.form)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        LOGGER.info(f"Multi-view rendering with {num_views} views.")
 
     LOGGER.info(f"Starting video generation | Mode: {output_mode} | Batch Size: {batch_size} | Quality: {quality}")
 
@@ -948,6 +1346,11 @@ def generate_video():
                 target=_process_sbs_video_job,
                 args=(job_id, tmp_path, original_stem, unique_id, predictor, device, fps, use_fp16, opacity_threshold, stereo_offset, brightness_factor, batch_size)
             )
+        elif output_mode == 'multi_view_frames':
+            thread = threading.Thread(
+                target=_process_multi_view_video_job,
+                args=(job_id, tmp_path, original_stem, unique_id, predictor, device, fps, use_fp16, angle_pairs, batch_size)
+            )
         else:
             thread = threading.Thread(
                 target=_process_video_job,
@@ -982,7 +1385,7 @@ def job_status(job_id):
         "fps": job["fps"],
         "error": job["error_msg"],
         "mode": job.get("mode", "ply_seq"),
-        "base_url": "/download/" if job.get("mode") == "sbs_movie" else "/ply/"
+        "base_url": "/download/" if job.get("mode") in {"sbs_movie", "multi_view_frames"} else "/ply/"
     })
 
 
