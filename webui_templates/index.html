@@ -1033,6 +1033,13 @@
                                 </div>
 
                                 <div class="input-group" style="margin-bottom: 8px;">
+                                    <label>Distance Multiplier:</label>
+                                    <input type="number" id="multi-view-distance" class="text-input" step="0.05"
+                                        min="0.05" value="1">
+                                    <small class="hint">Scales the camera distance to the target (1 = default).</small>
+                                </div>
+
+                                <div class="input-group" style="margin-bottom: 8px;">
                                     <label>Yaw/Pitch Angle List (CSV pairs):</label>
                                     <textarea id="multi-view-angle-list" class="text-input" rows="4"
                                         placeholder="Example: 0,0; 30,0; -30,0&#10;Or one pair per line"></textarea>
@@ -1338,6 +1345,7 @@
         const multiViewToggle = document.getElementById('multi-view-toggle');
         const multiViewSettings = document.getElementById('multi-view-settings');
         const multiViewCount = document.getElementById('multi-view-count');
+        const multiViewDistance = document.getElementById('multi-view-distance');
         const multiViewAngleList = document.getElementById('multi-view-angle-list');
         const multiViewYawStart = document.getElementById('multi-view-yaw-start');
         const multiViewYawEnd = document.getElementById('multi-view-yaw-end');
@@ -1626,6 +1634,7 @@
                 formData.append('frame_number', frameNumber);
                 formData.append('quality', quality);
                 formData.append('num_views', multiViewCount.value);
+                formData.append('view_distance', multiViewDistance.value);
                 formData.append('angle_list', multiViewAngleList.value);
                 formData.append('yaw_start', multiViewYawStart.value);
                 formData.append('yaw_end', multiViewYawEnd.value);
@@ -1904,6 +1913,7 @@
                 } else if (multiViewToggle && multiViewToggle.checked) {
                     formData.append('output_mode', 'multi_view_frames');
                     formData.append('num_views', multiViewCount.value);
+                    formData.append('view_distance', multiViewDistance.value);
                     formData.append('angle_list', multiViewAngleList.value);
                     formData.append('yaw_start', multiViewYawStart.value);
                     formData.append('yaw_end', multiViewYawEnd.value);
