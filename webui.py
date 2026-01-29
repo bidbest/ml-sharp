@@ -280,6 +280,12 @@ def _parse_multi_view_distance(form: dict) -> float:
     return distance
 
 
+def _parse_multi_view_match_source_resolution(form: dict) -> bool:
+    """Parse whether multi-view rendering should match the source resolution."""
+    value = str(form.get("multi_view_match_source", "")).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 def _build_view_extrinsics_from_angles(
     angle_pairs: list[tuple[float, float]],
     device: torch.device,
@@ -971,6 +977,7 @@ def _process_multi_view_video_job(
     angle_pairs,
     distance_factor,
     batch_size,
+    match_source_resolution,
 ):
     """Background worker for multi-view frame rendering."""
     if device.type != 'cuda':
@@ -1011,7 +1018,7 @@ def _process_multi_view_video_job(
             if reader is None:
                 reader = iio.get_reader(tmp_path)
 
-        render_w, render_h = 1280, 720
+        base_render_w, base_render_h = 1920, 1080
         renderer = gsplat.GSplatRenderer(color_space="linearRGB")
         extrinsics_list = _build_view_extrinsics_from_angles(
             angle_pairs, device, distance_factor=distance_factor
@@ -1030,6 +1037,7 @@ def _process_multi_view_video_job(
                         clean_frames.append(f)
 
                 h, w = clean_frames[0].shape[:2]
+                render_w, render_h = (w, h) if match_source_resolution else (base_render_w, base_render_h)
                 f_px = io.convert_focallength(w, h, 30.0)
 
                 gaussians_list = predict_batch(predictor, clean_frames, f_px, device, use_fp16=use_fp16)
@@ -1139,6 +1147,7 @@ def _process_multi_view_images_job(
     angle_pairs,
     distance_factor,
     batch_size,
+    match_source_resolution,
 ):
     """Background worker for multi-view image rendering using per-frame pose estimation."""
     if device.type != 'cuda':
@@ -1181,7 +1190,7 @@ def _process_multi_view_images_job(
             if reader is None:
                 reader = iio.get_reader(tmp_path)
 
-        render_w, render_h = 1280, 720
+        base_render_w, base_render_h = 1920, 1080
         renderer = gsplat.GSplatRenderer(color_space="linearRGB")
 
         batch_frames = []
@@ -1197,6 +1206,7 @@ def _process_multi_view_images_job(
                         clean_frames.append(f)
 
                 h, w = clean_frames[0].shape[:2]
+                render_w, render_h = (w, h) if match_source_resolution else (base_render_w, base_render_h)
                 f_px = io.convert_focallength(w, h, 30.0)
 
                 gaussians_list = predict_batch(predictor, clean_frames, f_px, device, use_fp16=use_fp16)
@@ -1605,6 +1615,7 @@ def generate_video():
     brightness_factor = float(request.form.get('brightness_factor', 1.0))
     angle_pairs = None
     distance_factor = 1.0
+    match_source_resolution = False
     
     # BATCH SIZE parsing
     try:
@@ -1617,6 +1628,7 @@ def generate_video():
         try:
             angle_pairs, num_views = _parse_multi_view_angles(request.form)
             distance_factor = _parse_multi_view_distance(request.form)
+            match_source_resolution = _parse_multi_view_match_source_resolution(request.form)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         LOGGER.info(f"Multi-view rendering with {num_views} views.")
@@ -1678,6 +1690,7 @@ def generate_video():
                     angle_pairs,
                     distance_factor,
                     batch_size,
+                    match_source_resolution,
                 )
             )
         elif output_mode == 'multi_view':
@@ -1695,6 +1708,7 @@ def generate_video():
                     angle_pairs,
                     distance_factor,
                     batch_size,
+                    match_source_resolution,
                 )
             )
         else:
