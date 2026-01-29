@@ -295,6 +295,45 @@ def _parse_multi_view_match_source_resolution(form: dict) -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def _sanitize_project_name(raw_name: str | None, fallback: str) -> str:
+    """Return a safe folder name for project output."""
+    if not raw_name:
+        return fallback
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name.strip())
+    return cleaned or fallback
+
+
+def _rotation_matrix_to_quaternion(rotation: torch.Tensor) -> tuple[float, float, float, float]:
+    """Convert a 3x3 rotation matrix to a quaternion (w, x, y, z)."""
+    rot = rotation.detach().cpu().numpy()
+    trace = rot[0, 0] + rot[1, 1] + rot[2, 2]
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        qw = 0.25 * s
+        qx = (rot[2, 1] - rot[1, 2]) / s
+        qy = (rot[0, 2] - rot[2, 0]) / s
+        qz = (rot[1, 0] - rot[0, 1]) / s
+    elif rot[0, 0] > rot[1, 1] and rot[0, 0] > rot[2, 2]:
+        s = math.sqrt(1.0 + rot[0, 0] - rot[1, 1] - rot[2, 2]) * 2.0
+        qw = (rot[2, 1] - rot[1, 2]) / s
+        qx = 0.25 * s
+        qy = (rot[0, 1] + rot[1, 0]) / s
+        qz = (rot[0, 2] + rot[2, 0]) / s
+    elif rot[1, 1] > rot[2, 2]:
+        s = math.sqrt(1.0 + rot[1, 1] - rot[0, 0] - rot[2, 2]) * 2.0
+        qw = (rot[0, 2] - rot[2, 0]) / s
+        qx = (rot[0, 1] + rot[1, 0]) / s
+        qy = 0.25 * s
+        qz = (rot[1, 2] + rot[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + rot[2, 2] - rot[0, 0] - rot[1, 1]) * 2.0
+        qw = (rot[1, 0] - rot[0, 1]) / s
+        qx = (rot[0, 2] + rot[2, 0]) / s
+        qy = (rot[1, 2] + rot[2, 1]) / s
+        qz = 0.25 * s
+    return qw, qx, qy, qz
+
+
 def _build_view_extrinsics_from_angles(
     angle_pairs: list[tuple[float, float]],
     device: torch.device,
@@ -964,6 +1003,7 @@ def _process_multi_view_video_job(
     tmp_path,
     original_stem,
     unique_id,
+    project_name,
     predictor,
     device,
     fps,
@@ -981,10 +1021,32 @@ def _process_multi_view_video_job(
         return
 
     job_prefix = get_next_job_prefix()
-    work_dir = OUTPUT_DIR / f"{job_prefix}_{original_stem}_multiview"
-    work_dir.mkdir(exist_ok=True)
+    fallback_name = f"{job_prefix}_{original_stem}_multiview"
+    project_dir = OUTPUT_DIR / _sanitize_project_name(project_name, fallback_name)
+    project_dir.mkdir(parents=True, exist_ok=True)
 
-    angles_path = work_dir / "view_angles.json"
+    camera_dirs = []
+    for idx in range(len(angle_pairs) + 1):
+        camera_dir = project_dir / f"camera_{idx:02d}"
+        camera_dir.mkdir(parents=True, exist_ok=True)
+        camera_dirs.append(camera_dir)
+
+    sparse_dir = project_dir / "sparse"
+    sparse_dir.mkdir(parents=True, exist_ok=True)
+    cameras_path = sparse_dir / "cameras.txt"
+    images_path = sparse_dir / "images.txt"
+    points_path = sparse_dir / "points3D.txt"
+
+    with images_path.open("w", encoding="utf-8") as images_file:
+        images_file.write("# Image list with two lines of data per image:\n")
+        images_file.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, IMAGE_NAME\n")
+        images_file.write("#   POINTS2D[] (empty)\n")
+
+    with points_path.open("w", encoding="utf-8") as points_file:
+        points_file.write("# 3D point list with one line of data per point:\n")
+        points_file.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]\n")
+
+    angles_path = project_dir / "view_angles.json"
     with angles_path.open("w", encoding="utf-8") as angles_file:
         json.dump(
             {
@@ -999,7 +1061,9 @@ def _process_multi_view_video_job(
             indent=2,
         )
 
-    LOGGER.info(f"Job {job_id} [{job_prefix}] | Batch: {batch_size} | Views: {len(angle_pairs)} | Folder: {work_dir}")
+    LOGGER.info(
+        f"Job {job_id} [{job_prefix}] | Batch: {batch_size} | Views: {len(angle_pairs)} | Folder: {project_dir}"
+    )
 
     reader = None
     try:
@@ -1007,7 +1071,7 @@ def _process_multi_view_video_job(
         try:
             reader = iio.get_reader(tmp_path)
             total_frames = reader.count_frames()
-            total_views = total_frames * len(angle_pairs)
+            total_views = total_frames * (len(angle_pairs) + 1)
             _active_jobs[job_id]['total_frames'] = total_views
         except Exception:
             _active_jobs[job_id]['total_frames'] = 0
@@ -1020,7 +1084,22 @@ def _process_multi_view_video_job(
         batch_frames = []
         batch_indices = []
 
+        cameras_written = False
+        image_id_counter = 1
+
+        def append_colmap_image(extrinsics, camera_id, image_name):
+            nonlocal image_id_counter
+            qw, qx, qy, qz = _rotation_matrix_to_quaternion(extrinsics[:3, :3])
+            tvec = extrinsics[:3, 3].detach().cpu().tolist()
+            with images_path.open("a", encoding="utf-8") as images_file:
+                images_file.write(
+                    f"{image_id_counter} {qw:.6f} {qx:.6f} {qy:.6f} {qz:.6f} "
+                    f"{tvec[0]:.6f} {tvec[1]:.6f} {tvec[2]:.6f} {camera_id} {image_name}\n\n"
+                )
+            image_id_counter += 1
+
         def process_multi_view_batch(frames, indices):
+            nonlocal cameras_written
             try:
                 clean_frames = []
                 for f in frames:
@@ -1033,15 +1112,46 @@ def _process_multi_view_video_job(
                 render_w, render_h = (w, h) if match_source_resolution else (base_render_w, base_render_h)
                 f_px = io.convert_focallength(w, h, 30.0)
 
-                gaussians_list = predict_batch(predictor, clean_frames, f_px, device, use_fp16=use_fp16)
-
                 f_px_render = f_px * (render_w / w)
+                gaussians_list = predict_batch(predictor, clean_frames, f_px, device, use_fp16=use_fp16)
                 intrinsics = torch.tensor([
                     [f_px_render, 0, render_w / 2, 0],
                     [0, f_px_render, render_h / 2, 0],
                     [0, 0, 1, 0],
                     [0, 0, 0, 1],
                 ], device=device, dtype=torch.float32)
+
+                source_camera_id = 1
+                render_camera_id = 1
+                if (render_w, render_h) != (w, h):
+                    render_camera_id = 2
+
+                if not cameras_written:
+                    camera_count = 2 if render_camera_id == 2 else 1
+                    with cameras_path.open("w", encoding="utf-8") as cameras_file:
+                        cameras_file.write("# Camera list with one line of data per camera:\n")
+                        cameras_file.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+                        cameras_file.write(f"# Number of cameras: {camera_count}\n")
+                        cameras_file.write(
+                            f"{source_camera_id} PINHOLE {w} {h} {f_px:.6f} {f_px:.6f} "
+                            f"{(w / 2):.6f} {(h / 2):.6f}\n"
+                        )
+                        if render_camera_id == 2:
+                            cameras_file.write(
+                                f"{render_camera_id} PINHOLE {render_w} {render_h} {f_px_render:.6f} "
+                                f"{f_px_render:.6f} {(render_w / 2):.6f} {(render_h / 2):.6f}\n"
+                            )
+                    cameras_written = True
+
+                identity_extrinsics = torch.eye(4, device=device)
+                for frame_idx, frame in zip(indices, clean_frames):
+                    frame_name = f"frame_{frame_idx:05d}.png"
+                    frame_path = camera_dirs[0] / frame_name
+                    Image.fromarray(frame).save(frame_path)
+                    relative_path = f"{project_dir.name}/camera_00/{frame_name}"
+                    _active_jobs[job_id]['files'].append(relative_path)
+                    _active_jobs[job_id]['processed_frames'] += 1
+                    append_colmap_image(identity_extrinsics, source_camera_id, f"camera_00/{frame_name}")
 
                 for k, gaussians in enumerate(gaussians_list):
                     idx = indices[k]
@@ -1071,13 +1181,17 @@ def _process_multi_view_video_job(
                         img_tensor = output.color[0].clamp(0, 1)
                         img = (img_tensor.permute(1, 2, 0) * 255).byte().cpu().numpy()
 
-                        frame_name = f"frame_{idx:05d}_view_{view_idx:02d}.png"
-                        frame_path = work_dir / frame_name
+                        frame_name = f"frame_{idx:05d}.png"
+                        camera_dir = camera_dirs[view_idx + 1]
+                        frame_path = camera_dir / frame_name
                         Image.fromarray(img).save(frame_path)
 
-                        relative_path = f"{work_dir.name}/{frame_name}"
+                        relative_path = f"{project_dir.name}/camera_{view_idx + 1:02d}/{frame_name}"
                         _active_jobs[job_id]['files'].append(relative_path)
                         _active_jobs[job_id]['processed_frames'] += 1
+                        append_colmap_image(
+                            extrinsics, render_camera_id, f"camera_{view_idx + 1:02d}/{frame_name}"
+                        )
 
                         del output, img_tensor, img
 
@@ -1145,6 +1259,7 @@ def _process_multi_view_images_job(
     tmp_path,
     original_stem,
     unique_id,
+    project_name,
     predictor,
     device,
     fps,
@@ -1162,10 +1277,32 @@ def _process_multi_view_images_job(
         return
 
     job_prefix = get_next_job_prefix()
-    work_dir = OUTPUT_DIR / f"{job_prefix}_{original_stem}_multiview_images"
-    work_dir.mkdir(exist_ok=True)
+    fallback_name = f"{job_prefix}_{original_stem}_multiview_images"
+    project_dir = OUTPUT_DIR / _sanitize_project_name(project_name, fallback_name)
+    project_dir.mkdir(parents=True, exist_ok=True)
 
-    angles_path = work_dir / "view_angles.json"
+    camera_dirs = []
+    for idx in range(len(angle_pairs) + 1):
+        camera_dir = project_dir / f"camera_{idx:02d}"
+        camera_dir.mkdir(parents=True, exist_ok=True)
+        camera_dirs.append(camera_dir)
+
+    sparse_dir = project_dir / "sparse"
+    sparse_dir.mkdir(parents=True, exist_ok=True)
+    cameras_path = sparse_dir / "cameras.txt"
+    images_path = sparse_dir / "images.txt"
+    points_path = sparse_dir / "points3D.txt"
+
+    with images_path.open("w", encoding="utf-8") as images_file:
+        images_file.write("# Image list with two lines of data per image:\n")
+        images_file.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, IMAGE_NAME\n")
+        images_file.write("#   POINTS2D[] (empty)\n")
+
+    with points_path.open("w", encoding="utf-8") as points_file:
+        points_file.write("# 3D point list with one line of data per point:\n")
+        points_file.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]\n")
+
+    angles_path = project_dir / "view_angles.json"
     with angles_path.open("w", encoding="utf-8") as angles_file:
         json.dump(
             {
@@ -1181,7 +1318,7 @@ def _process_multi_view_images_job(
         )
 
     LOGGER.info(
-        f"Job {job_id} [{job_prefix}] | Batch: {batch_size} | Views: {len(angle_pairs)} | Folder: {work_dir}"
+        f"Job {job_id} [{job_prefix}] | Batch: {batch_size} | Views: {len(angle_pairs)} | Folder: {project_dir}"
     )
 
     reader = None
@@ -1190,7 +1327,7 @@ def _process_multi_view_images_job(
         try:
             reader = iio.get_reader(tmp_path)
             total_frames = reader.count_frames()
-            total_views = total_frames * len(angle_pairs)
+            total_views = total_frames * (len(angle_pairs) + 1)
             _active_jobs[job_id]['total_frames'] = total_views
         except Exception:
             _active_jobs[job_id]['total_frames'] = 0
@@ -1203,7 +1340,22 @@ def _process_multi_view_images_job(
         batch_frames = []
         batch_indices = []
 
+        cameras_written = False
+        image_id_counter = 1
+
+        def append_colmap_image(extrinsics, camera_id, image_name):
+            nonlocal image_id_counter
+            qw, qx, qy, qz = _rotation_matrix_to_quaternion(extrinsics[:3, :3])
+            tvec = extrinsics[:3, 3].detach().cpu().tolist()
+            with images_path.open("a", encoding="utf-8") as images_file:
+                images_file.write(
+                    f"{image_id_counter} {qw:.6f} {qx:.6f} {qy:.6f} {qz:.6f} "
+                    f"{tvec[0]:.6f} {tvec[1]:.6f} {tvec[2]:.6f} {camera_id} {image_name}\n\n"
+                )
+            image_id_counter += 1
+
         def process_multi_view_batch(frames, indices):
+            nonlocal cameras_written
             try:
                 clean_frames = []
                 for f in frames:
@@ -1216,15 +1368,46 @@ def _process_multi_view_images_job(
                 render_w, render_h = (w, h) if match_source_resolution else (base_render_w, base_render_h)
                 f_px = io.convert_focallength(w, h, 30.0)
 
-                gaussians_list = predict_batch(predictor, clean_frames, f_px, device, use_fp16=use_fp16)
-
                 f_px_render = f_px * (render_w / w)
+                gaussians_list = predict_batch(predictor, clean_frames, f_px, device, use_fp16=use_fp16)
                 intrinsics = torch.tensor([
                     [f_px_render, 0, render_w / 2, 0],
                     [0, f_px_render, render_h / 2, 0],
                     [0, 0, 1, 0],
                     [0, 0, 0, 1],
                 ], device=device, dtype=torch.float32)
+
+                source_camera_id = 1
+                render_camera_id = 1
+                if (render_w, render_h) != (w, h):
+                    render_camera_id = 2
+
+                if not cameras_written:
+                    camera_count = 2 if render_camera_id == 2 else 1
+                    with cameras_path.open("w", encoding="utf-8") as cameras_file:
+                        cameras_file.write("# Camera list with one line of data per camera:\n")
+                        cameras_file.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+                        cameras_file.write(f"# Number of cameras: {camera_count}\n")
+                        cameras_file.write(
+                            f"{source_camera_id} PINHOLE {w} {h} {f_px:.6f} {f_px:.6f} "
+                            f"{(w / 2):.6f} {(h / 2):.6f}\n"
+                        )
+                        if render_camera_id == 2:
+                            cameras_file.write(
+                                f"{render_camera_id} PINHOLE {render_w} {render_h} {f_px_render:.6f} "
+                                f"{f_px_render:.6f} {(render_w / 2):.6f} {(render_h / 2):.6f}\n"
+                            )
+                    cameras_written = True
+
+                identity_extrinsics = torch.eye(4, device=device)
+                for frame_idx, frame in zip(indices, clean_frames):
+                    frame_name = f"frame_{frame_idx:05d}.png"
+                    frame_path = camera_dirs[0] / frame_name
+                    Image.fromarray(frame).save(frame_path)
+                    relative_path = f"{project_dir.name}/camera_00/{frame_name}"
+                    _active_jobs[job_id]['files'].append(relative_path)
+                    _active_jobs[job_id]['processed_frames'] += 1
+                    append_colmap_image(identity_extrinsics, source_camera_id, f"camera_00/{frame_name}")
 
                 for k, gaussians in enumerate(gaussians_list):
                     idx = indices[k]
@@ -1254,13 +1437,17 @@ def _process_multi_view_images_job(
                         img_tensor = output.color[0].clamp(0, 1)
                         img = (img_tensor.permute(1, 2, 0) * 255).byte().cpu().numpy()
 
-                        frame_name = f"frame_{idx:05d}_view_{view_idx:02d}.png"
-                        frame_path = work_dir / frame_name
+                        frame_name = f"frame_{idx:05d}.png"
+                        camera_dir = camera_dirs[view_idx + 1]
+                        frame_path = camera_dir / frame_name
                         Image.fromarray(img).save(frame_path)
 
-                        relative_path = f"{work_dir.name}/{frame_name}"
+                        relative_path = f"{project_dir.name}/camera_{view_idx + 1:02d}/{frame_name}"
                         _active_jobs[job_id]['files'].append(relative_path)
                         _active_jobs[job_id]['processed_frames'] += 1
+                        append_colmap_image(
+                            extrinsics, render_camera_id, f"camera_{view_idx + 1:02d}/{frame_name}"
+                        )
 
                         del output, img_tensor, img
 
@@ -1634,6 +1821,7 @@ def generate_video():
     orbit_radius = 1.0
     distance_factor = 1.0
     match_source_resolution = False
+    project_name = request.form.get('project_name', '').strip()
     
     # BATCH SIZE parsing
     try:
@@ -1702,6 +1890,7 @@ def generate_video():
                     tmp_path,
                     original_stem,
                     unique_id,
+                    project_name,
                     predictor,
                     device,
                     fps,
@@ -1721,6 +1910,7 @@ def generate_video():
                     tmp_path,
                     original_stem,
                     unique_id,
+                    project_name,
                     predictor,
                     device,
                     fps,
