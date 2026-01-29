@@ -1009,12 +1009,6 @@ def _process_multi_view_video_job(
 
         render_w, render_h = 1280, 720
         renderer = gsplat.GSplatRenderer(color_space="linearRGB")
-        extrinsics_list = _build_view_extrinsics_from_angles(
-            angle_pairs,
-            device,
-            radius=orbit_radius,
-            distance_factor=distance_factor,
-        )
 
         batch_frames = []
         batch_indices = []
@@ -1043,10 +1037,22 @@ def _process_multi_view_video_job(
 
                 for k, gaussians in enumerate(gaussians_list):
                     idx = indices[k]
-                    for view_idx, extrinsics in enumerate(extrinsics_list):
+                    for view_idx, (yaw, pitch) in enumerate(angle_pairs):
                         if _active_jobs[job_id]['stop_signal']:
                             return False
 
+                        extrinsics = _build_orbit_extrinsics(
+                            yaw,
+                            pitch,
+                            intrinsics,
+                            render_w,
+                            render_h,
+                            gaussians,
+                            renderer,
+                            device,
+                            orbit_radius=orbit_radius,
+                            distance_factor=distance_factor,
+                        )
                         output = renderer(
                             gaussians,
                             extrinsics=extrinsics.unsqueeze(0),
@@ -1526,15 +1532,20 @@ def preview_multi_view_frame():
             [0, 0, 0, 1],
         ], device=device, dtype=torch.float32)
 
-        extrinsics_list = _build_view_extrinsics_from_angles(
-            angle_pairs,
-            device,
-            radius=orbit_radius,
-            distance_factor=distance_factor,
-        )
-
         rendered_images = []
-        for extrinsics in extrinsics_list:
+        for yaw, pitch in angle_pairs:
+            extrinsics = _build_orbit_extrinsics(
+                yaw,
+                pitch,
+                intrinsics,
+                render_w,
+                render_h,
+                gaussians,
+                renderer,
+                device,
+                orbit_radius=orbit_radius,
+                distance_factor=distance_factor,
+            )
             output = renderer(
                 gaussians,
                 extrinsics=extrinsics.unsqueeze(0),
