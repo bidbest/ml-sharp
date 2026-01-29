@@ -15,6 +15,9 @@ import shutil
 import threading
 import time
 import gc
+import json
+import math
+import re
 from pathlib import Path
 import urllib.parse
 import traceback
@@ -197,6 +200,190 @@ def get_next_job_prefix() -> str:
         return "000"
 
 
+def _normalize_yaw_pitch(yaw: float, pitch: float) -> tuple[float, float]:
+    """Normalize yaw to [-180, 180) and clamp pitch to [-89, 89]."""
+    normalized_yaw = ((yaw + 180.0) % 360.0) - 180.0
+    clamped_pitch = max(min(pitch, 89.0), -89.0)
+    return normalized_yaw, clamped_pitch
+
+
+def _frange(start: float, end: float, step: float) -> list[float]:
+    """Floating range that includes the end value."""
+    if step == 0:
+        raise ValueError("Step must be non-zero.")
+    values = []
+    current = start
+    if step > 0:
+        while current <= end + 1e-9:
+            values.append(current)
+            current += step
+    else:
+        while current >= end - 1e-9:
+            values.append(current)
+            current += step
+    return values
+
+
+def _parse_angle_pairs(angle_list: str) -> list[tuple[float, float]]:
+    """Parse yaw/pitch pairs from a CSV list."""
+    pairs = []
+    entries = re.split(r"[;\n]+", angle_list.strip())
+    for entry in entries:
+        if not entry.strip():
+            continue
+        parts = [p for p in re.split(r"[,\s]+", entry.strip()) if p]
+        if len(parts) != 2:
+            raise ValueError(f"Invalid angle pair: '{entry}'. Expected 'yaw,pitch'.")
+        pairs.append((float(parts[0]), float(parts[1])))
+    return pairs
+
+
+def _parse_multi_view_angles(form: dict) -> tuple[list[tuple[float, float]], int]:
+    """Parse multi-view angle settings from form data."""
+    num_views_raw = str(form.get("num_views", "")).strip()
+    num_views = int(num_views_raw) if num_views_raw else 0
+    angle_list = str(form.get("angle_list", "")).strip()
+
+    if angle_list:
+        pairs = _parse_angle_pairs(angle_list)
+    else:
+        yaw_start = float(form.get("yaw_start", -30))
+        yaw_end = float(form.get("yaw_end", 30))
+        yaw_step = float(form.get("yaw_step", 15))
+        pitch_start = float(form.get("pitch_start", 0))
+        pitch_end = float(form.get("pitch_end", 0))
+        pitch_step = float(form.get("pitch_step", 15))
+
+        yaw_values = _frange(yaw_start, yaw_end, yaw_step)
+        pitch_values = _frange(pitch_start, pitch_end, pitch_step)
+        pairs = [(yaw, pitch) for pitch in pitch_values for yaw in yaw_values]
+
+    if not pairs:
+        raise ValueError("No angle pairs provided for multi-view rendering.")
+
+    normalized_pairs = [_normalize_yaw_pitch(yaw, pitch) for yaw, pitch in pairs]
+
+    if num_views and len(normalized_pairs) != num_views:
+        raise ValueError(
+            f"Expected {num_views} angle pairs but got {len(normalized_pairs)}."
+        )
+
+    return normalized_pairs, num_views or len(normalized_pairs)
+
+
+def _parse_multi_view_distance(form: dict) -> float:
+    """Parse the multi-view distance multiplier from form data."""
+    distance_raw = str(form.get("view_distance", "")).strip()
+    distance = float(distance_raw) if distance_raw else 1.0
+    if distance <= 0:
+        raise ValueError("Multi-view distance must be greater than 0.")
+    return distance
+
+
+
+def _parse_multi_view_radius(form: dict) -> float:
+    """Parse the multi-view orbit radius from form data."""
+    radius_raw = str(form.get("view_radius", "")).strip()
+    radius = float(radius_raw) if radius_raw else 1.0
+    if radius <= 0:
+        raise ValueError("Multi-view radius must be greater than 0.")
+    return radius
+
+def _parse_multi_view_match_source_resolution(form: dict) -> bool:
+    """Parse whether multi-view rendering should match the source resolution."""
+    value = str(form.get("multi_view_match_source", "")).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _sanitize_project_name(raw_name: str | None, fallback: str) -> str:
+    """Return a safe folder name for project output."""
+    if not raw_name:
+        return fallback
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name.strip())
+    return cleaned or fallback
+
+
+def _rotation_matrix_to_quaternion(rotation: torch.Tensor) -> tuple[float, float, float, float]:
+    """Convert a 3x3 rotation matrix to a quaternion (w, x, y, z)."""
+    rot = rotation.detach().cpu().numpy()
+    trace = rot[0, 0] + rot[1, 1] + rot[2, 2]
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        qw = 0.25 * s
+        qx = (rot[2, 1] - rot[1, 2]) / s
+        qy = (rot[0, 2] - rot[2, 0]) / s
+        qz = (rot[1, 0] - rot[0, 1]) / s
+    elif rot[0, 0] > rot[1, 1] and rot[0, 0] > rot[2, 2]:
+        s = math.sqrt(1.0 + rot[0, 0] - rot[1, 1] - rot[2, 2]) * 2.0
+        qw = (rot[2, 1] - rot[1, 2]) / s
+        qx = 0.25 * s
+        qy = (rot[0, 1] + rot[1, 0]) / s
+        qz = (rot[0, 2] + rot[2, 0]) / s
+    elif rot[1, 1] > rot[2, 2]:
+        s = math.sqrt(1.0 + rot[1, 1] - rot[0, 0] - rot[2, 2]) * 2.0
+        qw = (rot[0, 2] - rot[2, 0]) / s
+        qx = (rot[0, 1] + rot[1, 0]) / s
+        qy = 0.25 * s
+        qz = (rot[1, 2] + rot[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + rot[2, 2] - rot[0, 0] - rot[1, 1]) * 2.0
+        qw = (rot[1, 0] - rot[0, 1]) / s
+        qx = (rot[0, 2] + rot[2, 0]) / s
+        qy = (rot[1, 2] + rot[2, 1]) / s
+        qz = 0.25 * s
+    return qw, qx, qy, qz
+
+
+def _build_view_extrinsics_from_angles(
+    angle_pairs: list[tuple[float, float]],
+    device: torch.device,
+    radius: float = 3.0,
+    distance_factor: float = 1.0,
+) -> list[torch.Tensor]:
+    """Create extrinsics matrices for yaw/pitch camera angles relative to the default view."""
+    look_at = torch.zeros(3, device=device)
+    world_up = torch.tensor([0.0, -1.0, 0.0], device=device)
+    extrinsics_list = []
+    scaled_radius = max(radius * distance_factor, 1e-4)
+    base_offset = torch.tensor([0.0, 0.0, -scaled_radius], device=device, dtype=torch.float32)
+
+    for yaw, pitch in angle_pairs:
+        yaw_rad = math.radians(yaw)
+        pitch_rad = math.radians(pitch)
+
+        cos_yaw = math.cos(yaw_rad)
+        sin_yaw = math.sin(yaw_rad)
+        cos_pitch = math.cos(pitch_rad)
+        sin_pitch = math.sin(pitch_rad)
+
+        yaw_matrix = torch.tensor(
+            [
+                [cos_yaw, 0.0, -sin_yaw],
+                [0.0, 1.0, 0.0],
+                [sin_yaw, 0.0, cos_yaw],
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        pitch_matrix = torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, cos_pitch, -sin_pitch],
+                [0.0, sin_pitch, cos_pitch],
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+
+        position = look_at + (pitch_matrix @ (yaw_matrix @ base_offset))
+        extrinsics = camera.create_camera_matrix(
+            position, look_at_position=look_at, world_up=world_up, inverse=True
+        )
+        extrinsics_list.append(extrinsics)
+
+    return extrinsics_list
+
+
 @torch.no_grad()
 def predict_image(
     predictor: RGBGaussianPredictor,
@@ -284,6 +471,87 @@ def predict_batch(
         ))
         
     return results
+
+
+@torch.no_grad()
+def _build_orbit_extrinsics(
+    yaw_deg: float,
+    pitch_deg: float,
+    intrinsics: torch.Tensor,
+    render_w: int,
+    render_h: int,
+    gaussians: Gaussians3D,
+    renderer: gsplat.GSplatRenderer,
+    device: torch.device,
+    orbit_radius: float = 1.0,
+    distance_factor: float = 1.0,
+) -> torch.Tensor:
+    """Create camera extrinsics by orbiting around the depth center in OpenCV axes.
+
+    Positive yaw moves the camera toward +X (right) and positive pitch moves toward +Y (down),
+    preserving the OpenCV convention of X right, Y down, Z forward.
+    """
+    intrinsics = intrinsics.to(device=device, dtype=torch.float32)
+    if intrinsics.shape == (3, 3):
+        intrinsics_4x4 = torch.eye(4, device=device, dtype=torch.float32)
+        intrinsics_4x4[:3, :3] = intrinsics
+        intrinsics = intrinsics_4x4
+
+    base_extrinsics = torch.eye(4, device=device, dtype=torch.float32)
+    rendering = renderer(
+        gaussians,
+        extrinsics=base_extrinsics.unsqueeze(0),
+        intrinsics=intrinsics.unsqueeze(0),
+        image_width=render_w,
+        image_height=render_h,
+    )
+
+    depth_map = rendering.depth[0, 0]
+    center_x = render_w // 2
+    center_y = render_h // 2
+    center_depth = depth_map[center_y, center_x]
+    if not torch.isfinite(center_depth) or center_depth <= 0:
+        valid_depths = depth_map[depth_map > 0]
+        center_depth = valid_depths.median() if valid_depths.numel() > 0 else torch.tensor(
+            1.0, device=device
+        )
+
+    fx = intrinsics[0, 0]
+    fy = intrinsics[1, 1]
+    cx = intrinsics[0, 2]
+    cy = intrinsics[1, 2]
+
+    center_point = torch.stack(
+        [
+            (center_x - cx) * center_depth / fx,
+            (center_y - cy) * center_depth / fy,
+            center_depth,
+        ],
+        dim=0,
+    )
+
+    yaw_rad = torch.deg2rad(torch.tensor(yaw_deg, device=device))
+    pitch_rad = torch.deg2rad(torch.tensor(pitch_deg, device=device))
+
+    scaled_radius = max(orbit_radius * distance_factor, 1e-4)
+    radius_tensor = torch.tensor(scaled_radius, device=device, dtype=torch.float32)
+    offset = torch.stack(
+        [
+            torch.sin(yaw_rad) * torch.cos(pitch_rad),
+            torch.sin(pitch_rad),
+            -torch.cos(yaw_rad) * torch.cos(pitch_rad),
+        ],
+        dim=0,
+    ) * radius_tensor
+    camera_position = center_point + offset
+    world_up = torch.tensor([0.0, -1.0, 0.0], device=device)
+
+    return camera.create_camera_matrix(
+        position=camera_position,
+        look_at_position=center_point,
+        world_up=world_up,
+        inverse=True,
+    )
 
 
 @app.route("/")
@@ -730,6 +998,542 @@ def _process_sbs_video_job(job_id, tmp_path, original_stem, unique_id, predictor
         # if work_dir.exists(): try: shutil.rmtree(work_dir) except: pass
 
 
+def _process_multi_view_video_job(
+    job_id,
+    tmp_path,
+    original_stem,
+    unique_id,
+    project_name,
+    predictor,
+    device,
+    fps,
+    use_fp16,
+    angle_pairs,
+    orbit_radius,
+    distance_factor,
+    batch_size,
+    match_source_resolution,
+):
+    """Background worker for multi-view frame rendering."""
+    if device.type != 'cuda':
+        _active_jobs[job_id]['status'] = 'error'
+        _active_jobs[job_id]['error_msg'] = "Multi-view rendering requires a CUDA GPU."
+        return
+
+    job_prefix = get_next_job_prefix()
+    fallback_name = f"{job_prefix}_{original_stem}_multiview"
+    project_dir = OUTPUT_DIR / _sanitize_project_name(project_name, fallback_name)
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    camera_dirs = []
+    for idx in range(len(angle_pairs) + 1):
+        camera_dir = project_dir / f"camera_{idx:02d}"
+        camera_dir.mkdir(parents=True, exist_ok=True)
+        camera_dirs.append(camera_dir)
+
+    sparse_dir = project_dir / "sparse"
+    sparse_dir.mkdir(parents=True, exist_ok=True)
+    cameras_path = sparse_dir / "cameras.txt"
+    images_path = sparse_dir / "images.txt"
+    points_path = sparse_dir / "points3D.txt"
+
+    with images_path.open("w", encoding="utf-8") as images_file:
+        images_file.write("# Image list with two lines of data per image:\n")
+        images_file.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, IMAGE_NAME\n")
+        images_file.write("#   POINTS2D[] (empty)\n")
+
+    with points_path.open("w", encoding="utf-8") as points_file:
+        points_file.write("# 3D point list with one line of data per point:\n")
+        points_file.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]\n")
+
+    angles_path = project_dir / "view_angles.json"
+    with angles_path.open("w", encoding="utf-8") as angles_file:
+        json.dump(
+            {
+                "distance_factor": distance_factor,
+                "orbit_radius": orbit_radius,
+                "views": [
+                    {"index": idx, "yaw": yaw, "pitch": pitch}
+                    for idx, (yaw, pitch) in enumerate(angle_pairs)
+                ],
+            },
+            angles_file,
+            indent=2,
+        )
+
+    LOGGER.info(
+        f"Job {job_id} [{job_prefix}] | Batch: {batch_size} | Views: {len(angle_pairs)} | Folder: {project_dir}"
+    )
+
+    reader = None
+    try:
+        total_frames = 0
+        try:
+            reader = iio.get_reader(tmp_path)
+            total_frames = reader.count_frames()
+            total_views = total_frames * (len(angle_pairs) + 1)
+            _active_jobs[job_id]['total_frames'] = total_views
+        except Exception:
+            _active_jobs[job_id]['total_frames'] = 0
+            if reader is None:
+                reader = iio.get_reader(tmp_path)
+
+        base_render_w, base_render_h = 1920, 1080
+        renderer = gsplat.GSplatRenderer(color_space="linearRGB")
+
+        batch_frames = []
+        batch_indices = []
+
+        cameras_written = False
+        image_id_counter = 1
+
+        def append_colmap_image(extrinsics, camera_id, image_name):
+            nonlocal image_id_counter
+            qw, qx, qy, qz = _rotation_matrix_to_quaternion(extrinsics[:3, :3])
+            tvec = extrinsics[:3, 3].detach().cpu().tolist()
+            with images_path.open("a", encoding="utf-8") as images_file:
+                images_file.write(
+                    f"{image_id_counter} {qw:.6f} {qx:.6f} {qy:.6f} {qz:.6f} "
+                    f"{tvec[0]:.6f} {tvec[1]:.6f} {tvec[2]:.6f} {camera_id} {image_name}\n\n"
+                )
+            image_id_counter += 1
+
+        cached_extrinsics = None
+        cached_render_state = None
+
+        def process_multi_view_batch(frames, indices):
+            nonlocal cameras_written, cached_extrinsics, cached_render_state
+            try:
+                clean_frames = []
+                for f in frames:
+                    if f.shape[2] > 3:
+                        clean_frames.append(f[:, :, :3])
+                    else:
+                        clean_frames.append(f)
+
+                h, w = clean_frames[0].shape[:2]
+                render_w, render_h = (w, h) if match_source_resolution else (base_render_w, base_render_h)
+                f_px = io.convert_focallength(w, h, 30.0)
+
+                f_px_render = f_px * (render_w / w)
+                gaussians_list = predict_batch(predictor, clean_frames, f_px, device, use_fp16=use_fp16)
+                intrinsics = torch.tensor([
+                    [f_px_render, 0, render_w / 2, 0],
+                    [0, f_px_render, render_h / 2, 0],
+                    [0, 0, 1, 0],
+                    [0, 0, 0, 1],
+                ], device=device, dtype=torch.float32)
+
+                source_camera_id = 1
+                render_camera_id = 1
+                if (render_w, render_h) != (w, h):
+                    render_camera_id = 2
+
+                if not cameras_written:
+                    camera_count = 2 if render_camera_id == 2 else 1
+                    with cameras_path.open("w", encoding="utf-8") as cameras_file:
+                        cameras_file.write("# Camera list with one line of data per camera:\n")
+                        cameras_file.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+                        cameras_file.write(f"# Number of cameras: {camera_count}\n")
+                        cameras_file.write(
+                            f"{source_camera_id} PINHOLE {w} {h} {f_px:.6f} {f_px:.6f} "
+                            f"{(w / 2):.6f} {(h / 2):.6f}\n"
+                        )
+                        if render_camera_id == 2:
+                            cameras_file.write(
+                                f"{render_camera_id} PINHOLE {render_w} {render_h} {f_px_render:.6f} "
+                                f"{f_px_render:.6f} {(render_w / 2):.6f} {(render_h / 2):.6f}\n"
+                            )
+                    cameras_written = True
+
+                identity_extrinsics = torch.eye(4, device=device)
+                for frame_idx, frame in zip(indices, clean_frames):
+                    frame_name = f"frame_{frame_idx:05d}.png"
+                    frame_path = camera_dirs[0] / frame_name
+                    Image.fromarray(frame).save(frame_path)
+                    relative_path = f"{project_dir.name}/camera_00/{frame_name}"
+                    _active_jobs[job_id]['files'].append(relative_path)
+                    _active_jobs[job_id]['processed_frames'] += 1
+                    append_colmap_image(identity_extrinsics, source_camera_id, f"camera_00/{frame_name}")
+
+                render_state = (render_w, render_h, float(f_px_render))
+                if cached_extrinsics is None or cached_render_state != render_state:
+                    cached_render_state = render_state
+                    cached_extrinsics = []
+                    reference_gaussians = gaussians_list[0]
+                    for yaw, pitch in angle_pairs:
+                        cached_extrinsics.append(
+                            _build_orbit_extrinsics(
+                                yaw,
+                                pitch,
+                                intrinsics,
+                                render_w,
+                                render_h,
+                                reference_gaussians,
+                                renderer,
+                                device,
+                                orbit_radius=orbit_radius,
+                                distance_factor=distance_factor,
+                            )
+                        )
+
+                for k, gaussians in enumerate(gaussians_list):
+                    idx = indices[k]
+                    for view_idx, extrinsics in enumerate(cached_extrinsics):
+                        if _active_jobs[job_id]['stop_signal']:
+                            return False
+
+                        output = renderer(
+                            gaussians,
+                            extrinsics=extrinsics.unsqueeze(0),
+                            intrinsics=intrinsics.unsqueeze(0),
+                            image_width=render_w,
+                            image_height=render_h,
+                        )
+                        img_tensor = output.color[0].clamp(0, 1)
+                        img = (img_tensor.permute(1, 2, 0) * 255).byte().cpu().numpy()
+
+                        frame_name = f"frame_{idx:05d}.png"
+                        camera_dir = camera_dirs[view_idx + 1]
+                        frame_path = camera_dir / frame_name
+                        Image.fromarray(img).save(frame_path)
+
+                        relative_path = f"{project_dir.name}/camera_{view_idx + 1:02d}/{frame_name}"
+                        _active_jobs[job_id]['files'].append(relative_path)
+                        _active_jobs[job_id]['processed_frames'] += 1
+                        append_colmap_image(
+                            extrinsics, render_camera_id, f"camera_{view_idx + 1:02d}/{frame_name}"
+                        )
+
+                        del output, img_tensor, img
+
+                    del gaussians
+
+                torch.cuda.empty_cache()
+                gc.collect()
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() and len(frames) > 1:
+                    LOGGER.warning(f"OOM in multi-view job with batch {len(frames)}. Switching to 1.")
+                    torch.cuda.empty_cache()
+                    for idx, single_frame in enumerate(frames):
+                        process_multi_view_batch([single_frame], [indices[idx]])
+                    return True
+                raise e
+            return False
+
+        fallback_mode = False
+
+        for i, frame in enumerate(reader):
+            if _active_jobs[job_id]['stop_signal']:
+                LOGGER.info(f"Job {job_id} stopped by user.")
+                _active_jobs[job_id]['status'] = 'stopped'
+                break
+
+            batch_frames.append(frame)
+            batch_indices.append(i)
+
+            effective_bs = 1 if fallback_mode else batch_size
+            if len(batch_frames) >= effective_bs:
+                oom = process_multi_view_batch(batch_frames, batch_indices)
+                if oom:
+                    fallback_mode = True
+                batch_frames = []
+                batch_indices = []
+
+            if i % 10 == 0:
+                LOGGER.info(f"Job {job_id}: Rendered frame {i + 1}")
+
+        if batch_frames and not _active_jobs[job_id]['stop_signal']:
+            process_multi_view_batch(batch_frames, batch_indices)
+
+        if not _active_jobs[job_id]['stop_signal']:
+            _active_jobs[job_id]['status'] = 'done'
+
+    except Exception as e:
+        LOGGER.exception(f"Job {job_id} failed")
+        _active_jobs[job_id]['status'] = 'error'
+        _active_jobs[job_id]['error_msg'] = str(e)
+    finally:
+        if reader:
+            try:
+                reader.close()
+            except:
+                pass
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except:
+                pass
+
+
+def _process_multi_view_images_job(
+    job_id,
+    tmp_path,
+    original_stem,
+    unique_id,
+    project_name,
+    predictor,
+    device,
+    fps,
+    use_fp16,
+    angle_pairs,
+    orbit_radius,
+    distance_factor,
+    batch_size,
+    match_source_resolution,
+):
+    """Background worker for multi-view image rendering with a fixed pose from the first frame."""
+    if device.type != 'cuda':
+        _active_jobs[job_id]['status'] = 'error'
+        _active_jobs[job_id]['error_msg'] = "Multi-view rendering requires a CUDA GPU."
+        return
+
+    job_prefix = get_next_job_prefix()
+    fallback_name = f"{job_prefix}_{original_stem}_multiview_images"
+    project_dir = OUTPUT_DIR / _sanitize_project_name(project_name, fallback_name)
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    camera_dirs = []
+    for idx in range(len(angle_pairs) + 1):
+        camera_dir = project_dir / f"camera_{idx:02d}"
+        camera_dir.mkdir(parents=True, exist_ok=True)
+        camera_dirs.append(camera_dir)
+
+    sparse_dir = project_dir / "sparse"
+    sparse_dir.mkdir(parents=True, exist_ok=True)
+    cameras_path = sparse_dir / "cameras.txt"
+    images_path = sparse_dir / "images.txt"
+    points_path = sparse_dir / "points3D.txt"
+
+    with images_path.open("w", encoding="utf-8") as images_file:
+        images_file.write("# Image list with two lines of data per image:\n")
+        images_file.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, IMAGE_NAME\n")
+        images_file.write("#   POINTS2D[] (empty)\n")
+
+    with points_path.open("w", encoding="utf-8") as points_file:
+        points_file.write("# 3D point list with one line of data per point:\n")
+        points_file.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]\n")
+
+    angles_path = project_dir / "view_angles.json"
+    with angles_path.open("w", encoding="utf-8") as angles_file:
+        json.dump(
+            {
+                "distance_factor": distance_factor,
+                "orbit_radius": orbit_radius,
+                "views": [
+                    {"index": idx, "yaw": yaw, "pitch": pitch}
+                    for idx, (yaw, pitch) in enumerate(angle_pairs)
+                ],
+            },
+            angles_file,
+            indent=2,
+        )
+
+    LOGGER.info(
+        f"Job {job_id} [{job_prefix}] | Batch: {batch_size} | Views: {len(angle_pairs)} | Folder: {project_dir}"
+    )
+
+    reader = None
+    try:
+        total_frames = 0
+        try:
+            reader = iio.get_reader(tmp_path)
+            total_frames = reader.count_frames()
+            total_views = total_frames * (len(angle_pairs) + 1)
+            _active_jobs[job_id]['total_frames'] = total_views
+        except Exception:
+            _active_jobs[job_id]['total_frames'] = 0
+            if reader is None:
+                reader = iio.get_reader(tmp_path)
+
+        base_render_w, base_render_h = 1920, 1080
+        renderer = gsplat.GSplatRenderer(color_space="linearRGB")
+
+        batch_frames = []
+        batch_indices = []
+
+        cameras_written = False
+        image_id_counter = 1
+
+        def append_colmap_image(extrinsics, camera_id, image_name):
+            nonlocal image_id_counter
+            qw, qx, qy, qz = _rotation_matrix_to_quaternion(extrinsics[:3, :3])
+            tvec = extrinsics[:3, 3].detach().cpu().tolist()
+            with images_path.open("a", encoding="utf-8") as images_file:
+                images_file.write(
+                    f"{image_id_counter} {qw:.6f} {qx:.6f} {qy:.6f} {qz:.6f} "
+                    f"{tvec[0]:.6f} {tvec[1]:.6f} {tvec[2]:.6f} {camera_id} {image_name}\n\n"
+                )
+            image_id_counter += 1
+
+        cached_extrinsics = None
+        cached_render_state = None
+
+        def process_multi_view_batch(frames, indices):
+            nonlocal cameras_written, cached_extrinsics, cached_render_state
+            try:
+                clean_frames = []
+                for f in frames:
+                    if f.shape[2] > 3:
+                        clean_frames.append(f[:, :, :3])
+                    else:
+                        clean_frames.append(f)
+
+                h, w = clean_frames[0].shape[:2]
+                render_w, render_h = (w, h) if match_source_resolution else (base_render_w, base_render_h)
+                f_px = io.convert_focallength(w, h, 30.0)
+
+                f_px_render = f_px * (render_w / w)
+                gaussians_list = predict_batch(predictor, clean_frames, f_px, device, use_fp16=use_fp16)
+                intrinsics = torch.tensor([
+                    [f_px_render, 0, render_w / 2, 0],
+                    [0, f_px_render, render_h / 2, 0],
+                    [0, 0, 1, 0],
+                    [0, 0, 0, 1],
+                ], device=device, dtype=torch.float32)
+
+                source_camera_id = 1
+                render_camera_id = 1
+                if (render_w, render_h) != (w, h):
+                    render_camera_id = 2
+
+                if not cameras_written:
+                    camera_count = 2 if render_camera_id == 2 else 1
+                    with cameras_path.open("w", encoding="utf-8") as cameras_file:
+                        cameras_file.write("# Camera list with one line of data per camera:\n")
+                        cameras_file.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+                        cameras_file.write(f"# Number of cameras: {camera_count}\n")
+                        cameras_file.write(
+                            f"{source_camera_id} PINHOLE {w} {h} {f_px:.6f} {f_px:.6f} "
+                            f"{(w / 2):.6f} {(h / 2):.6f}\n"
+                        )
+                        if render_camera_id == 2:
+                            cameras_file.write(
+                                f"{render_camera_id} PINHOLE {render_w} {render_h} {f_px_render:.6f} "
+                                f"{f_px_render:.6f} {(render_w / 2):.6f} {(render_h / 2):.6f}\n"
+                            )
+                    cameras_written = True
+
+                identity_extrinsics = torch.eye(4, device=device)
+                for frame_idx, frame in zip(indices, clean_frames):
+                    frame_name = f"frame_{frame_idx:05d}.png"
+                    frame_path = camera_dirs[0] / frame_name
+                    Image.fromarray(frame).save(frame_path)
+                    relative_path = f"{project_dir.name}/camera_00/{frame_name}"
+                    _active_jobs[job_id]['files'].append(relative_path)
+                    _active_jobs[job_id]['processed_frames'] += 1
+                    append_colmap_image(identity_extrinsics, source_camera_id, f"camera_00/{frame_name}")
+
+                render_state = (render_w, render_h, float(f_px_render))
+                if cached_extrinsics is None or cached_render_state != render_state:
+                    cached_render_state = render_state
+                    cached_extrinsics = []
+                    reference_gaussians = gaussians_list[0]
+                    for yaw, pitch in angle_pairs:
+                        cached_extrinsics.append(
+                            _build_orbit_extrinsics(
+                                yaw,
+                                pitch,
+                                intrinsics,
+                                render_w,
+                                render_h,
+                                reference_gaussians,
+                                renderer,
+                                device,
+                                orbit_radius=orbit_radius,
+                                distance_factor=distance_factor,
+                            )
+                        )
+
+                for k, gaussians in enumerate(gaussians_list):
+                    idx = indices[k]
+                    for view_idx, extrinsics in enumerate(cached_extrinsics):
+                        if _active_jobs[job_id]['stop_signal']:
+                            return False
+
+                        output = renderer(
+                            gaussians,
+                            extrinsics=extrinsics.unsqueeze(0),
+                            intrinsics=intrinsics.unsqueeze(0),
+                            image_width=render_w,
+                            image_height=render_h,
+                        )
+                        img_tensor = output.color[0].clamp(0, 1)
+                        img = (img_tensor.permute(1, 2, 0) * 255).byte().cpu().numpy()
+
+                        frame_name = f"frame_{idx:05d}.png"
+                        camera_dir = camera_dirs[view_idx + 1]
+                        frame_path = camera_dir / frame_name
+                        Image.fromarray(img).save(frame_path)
+
+                        relative_path = f"{project_dir.name}/camera_{view_idx + 1:02d}/{frame_name}"
+                        _active_jobs[job_id]['files'].append(relative_path)
+                        _active_jobs[job_id]['processed_frames'] += 1
+                        append_colmap_image(
+                            extrinsics, render_camera_id, f"camera_{view_idx + 1:02d}/{frame_name}"
+                        )
+
+                        del output, img_tensor, img
+
+                    del gaussians
+
+                torch.cuda.empty_cache()
+                gc.collect()
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() and len(frames) > 1:
+                    LOGGER.warning(f"OOM in multi-view job with batch {len(frames)}. Switching to 1.")
+                    torch.cuda.empty_cache()
+                    for idx, single_frame in enumerate(frames):
+                        process_multi_view_batch([single_frame], [indices[idx]])
+                    return True
+                raise e
+            return False
+
+        fallback_mode = False
+
+        for i, frame in enumerate(reader):
+            if _active_jobs[job_id]['stop_signal']:
+                LOGGER.info(f"Job {job_id} stopped by user.")
+                _active_jobs[job_id]['status'] = 'stopped'
+                break
+
+            batch_frames.append(frame)
+            batch_indices.append(i)
+
+            effective_bs = 1 if fallback_mode else batch_size
+            if len(batch_frames) >= effective_bs:
+                oom = process_multi_view_batch(batch_frames, batch_indices)
+                if oom:
+                    fallback_mode = True
+                batch_frames = []
+                batch_indices = []
+
+            if i % 10 == 0:
+                LOGGER.info(f"Job {job_id}: Rendered frame {i + 1}")
+
+        if batch_frames and not _active_jobs[job_id]['stop_signal']:
+            process_multi_view_batch(batch_frames, batch_indices)
+
+        if not _active_jobs[job_id]['stop_signal']:
+            _active_jobs[job_id]['status'] = 'done'
+
+    except Exception as e:
+        LOGGER.exception(f"Job {job_id} failed")
+        _active_jobs[job_id]['status'] = 'error'
+        _active_jobs[job_id]['error_msg'] = str(e)
+    finally:
+        if reader:
+            try:
+                reader.close()
+            except:
+                pass
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except:
+                pass
+
+
 @app.route("/preview_sbs_frame", methods=["POST"])
 def preview_sbs_frame():
     """Generate a single SBS preview frame from a video for testing settings."""
@@ -881,6 +1685,145 @@ def preview_sbs_frame():
                 pass
 
 
+@app.route("/preview_multi_view_frame", methods=["POST"])
+def preview_multi_view_frame():
+    """Generate a multi-view preview grid from a video frame."""
+    if "video" not in request.files:
+        return jsonify({"error": "No video file provided"}), 400
+
+    file = request.files["video"]
+    if file.filename == "":
+        return jsonify({"error": "No file selected"}), 400
+
+    try:
+        frame_number = int(request.form.get('frame_number', 0))
+    except ValueError:
+        frame_number = 0
+
+    quality = request.form.get('quality', 'balanced')
+    use_fp16 = (quality == 'fast')
+
+    try:
+        angle_pairs, _ = _parse_multi_view_angles(request.form)
+        orbit_radius = _parse_multi_view_radius(request.form)
+        distance_factor = _parse_multi_view_distance(request.form)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    allowed_extensions = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+    ext = Path(file.filename).suffix.lower()
+    if ext not in allowed_extensions:
+        return jsonify({"error": f"Unsupported file type: {ext}"}), 400
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            file.save(tmp.name)
+            tmp_path = Path(tmp.name)
+
+        predictor, device = get_predictor()
+
+        if device.type != 'cuda':
+            return jsonify({"error": "Multi-view preview requires a CUDA GPU."}), 400
+
+        reader = iio.get_reader(tmp_path)
+        try:
+            frame = reader.get_data(frame_number)
+        except IndexError:
+            reader.close()
+            return jsonify({"error": f"Frame {frame_number} out of range"}), 400
+        reader.close()
+
+        if frame.shape[2] > 3:
+            frame = frame[:, :, :3]
+
+        h, w = frame.shape[:2]
+        f_px = io.convert_focallength(w, h, 30.0)
+
+        gaussians = predict_image(predictor, frame, f_px, device, use_fp16=use_fp16)
+
+        render_w, render_h = 640, 360
+        renderer = gsplat.GSplatRenderer(color_space="linearRGB")
+
+        f_px_render = f_px * (render_w / w)
+        intrinsics = torch.tensor([
+            [f_px_render, 0, render_w / 2, 0],
+            [0, f_px_render, render_h / 2, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ], device=device, dtype=torch.float32)
+
+        rendered_images = []
+        for yaw, pitch in angle_pairs:
+            extrinsics = _build_orbit_extrinsics(
+                yaw,
+                pitch,
+                intrinsics,
+                render_w,
+                render_h,
+                gaussians,
+                renderer,
+                device,
+                orbit_radius=orbit_radius,
+                distance_factor=distance_factor,
+            )
+            output = renderer(
+                gaussians,
+                extrinsics=extrinsics.unsqueeze(0),
+                intrinsics=intrinsics.unsqueeze(0),
+                image_width=render_w,
+                image_height=render_h,
+            )
+            img_tensor = output.color[0].clamp(0, 1)
+            img = (img_tensor.permute(1, 2, 0) * 255).byte().cpu().numpy()
+            rendered_images.append(img)
+            del output, img_tensor
+
+        cols = math.ceil(math.sqrt(len(rendered_images)))
+        rows = math.ceil(len(rendered_images) / cols)
+        grid = np.zeros((rows * render_h, cols * render_w, 3), dtype=np.uint8)
+
+        for idx, img in enumerate(rendered_images):
+            row = idx // cols
+            col = idx % cols
+            y0 = row * render_h
+            x0 = col * render_w
+            grid[y0:y0 + render_h, x0:x0 + render_w] = img
+
+        del gaussians
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as out_tmp:
+            Image.fromarray(grid).save(out_tmp.name, "JPEG", quality=90)
+            out_tmp_path = Path(out_tmp.name)
+
+        response = send_file(
+            out_tmp_path,
+            mimetype='image/jpeg',
+            as_attachment=False
+        )
+
+        @response.call_on_close
+        def cleanup():
+            try:
+                out_tmp_path.unlink()
+            except:
+                pass
+
+        return response
+
+    except Exception as e:
+        LOGGER.exception("Error generating multi-view preview")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if tmp_path and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except:
+                pass
+
+
 @app.route("/generate_video", methods=["POST"])
 def generate_video():
     """Start async video generation."""
@@ -898,6 +1841,11 @@ def generate_video():
     opacity_threshold = float(request.form.get('opacity_threshold', 0.0))
     stereo_offset = float(request.form.get('stereo_offset', 0.015))
     brightness_factor = float(request.form.get('brightness_factor', 1.0))
+    angle_pairs = None
+    orbit_radius = 1.0
+    distance_factor = 1.0
+    match_source_resolution = False
+    project_name = request.form.get('project_name', '').strip()
     
     # BATCH SIZE parsing
     try:
@@ -905,6 +1853,16 @@ def generate_video():
         if batch_size < 1: batch_size = 1
     except:
         batch_size = 1
+
+    if output_mode in {'multi_view_frames', 'multi_view'}:
+        try:
+            angle_pairs, num_views = _parse_multi_view_angles(request.form)
+            orbit_radius = _parse_multi_view_radius(request.form)
+            distance_factor = _parse_multi_view_distance(request.form)
+            match_source_resolution = _parse_multi_view_match_source_resolution(request.form)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        LOGGER.info(f"Multi-view rendering with {num_views} views.")
 
     LOGGER.info(f"Starting video generation | Mode: {output_mode} | Batch Size: {batch_size} | Quality: {quality}")
 
@@ -948,6 +1906,46 @@ def generate_video():
                 target=_process_sbs_video_job,
                 args=(job_id, tmp_path, original_stem, unique_id, predictor, device, fps, use_fp16, opacity_threshold, stereo_offset, brightness_factor, batch_size)
             )
+        elif output_mode == 'multi_view_frames':
+            thread = threading.Thread(
+                target=_process_multi_view_video_job,
+                args=(
+                    job_id,
+                    tmp_path,
+                    original_stem,
+                    unique_id,
+                    project_name,
+                    predictor,
+                    device,
+                    fps,
+                    use_fp16,
+                    angle_pairs,
+                    orbit_radius,
+                    distance_factor,
+                    batch_size,
+                    match_source_resolution,
+                )
+            )
+        elif output_mode == 'multi_view':
+            thread = threading.Thread(
+                target=_process_multi_view_images_job,
+                args=(
+                    job_id,
+                    tmp_path,
+                    original_stem,
+                    unique_id,
+                    project_name,
+                    predictor,
+                    device,
+                    fps,
+                    use_fp16,
+                    angle_pairs,
+                    orbit_radius,
+                    distance_factor,
+                    batch_size,
+                    match_source_resolution,
+                )
+            )
         else:
             thread = threading.Thread(
                 target=_process_video_job,
@@ -982,7 +1980,7 @@ def job_status(job_id):
         "fps": job["fps"],
         "error": job["error_msg"],
         "mode": job.get("mode", "ply_seq"),
-        "base_url": "/download/" if job.get("mode") == "sbs_movie" else "/ply/"
+        "base_url": "/download/" if job.get("mode") in {"sbs_movie", "multi_view_frames", "multi_view"} else "/ply/"
     })
 
 
