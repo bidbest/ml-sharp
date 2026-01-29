@@ -286,6 +286,101 @@ def predict_batch(
     return results
 
 
+@torch.no_grad()
+def _build_view_extrinsics(
+    yaw_deg: float,
+    pitch_deg: float,
+    intrinsics: torch.Tensor,
+    render_w: int,
+    render_h: int,
+    gaussians: Gaussians3D,
+    device: torch.device,
+) -> torch.Tensor:
+    """Create camera extrinsics by orbiting around the depth center in OpenCV axes.
+
+    Positive yaw moves the camera toward +X (right) and positive pitch moves toward +Y (down),
+    preserving the OpenCV convention of X right, Y down, Z forward.
+    """
+    renderer = gsplat.GSplatRenderer(color_space="linearRGB")
+    intrinsics = intrinsics.to(device=device, dtype=torch.float32)
+    if intrinsics.shape == (3, 3):
+        intrinsics_4x4 = torch.eye(4, device=device, dtype=torch.float32)
+        intrinsics_4x4[:3, :3] = intrinsics
+        intrinsics = intrinsics_4x4
+
+    base_extrinsics = torch.eye(4, device=device, dtype=torch.float32)
+    rendering = renderer(
+        gaussians,
+        extrinsics=base_extrinsics.unsqueeze(0),
+        intrinsics=intrinsics.unsqueeze(0),
+        image_width=render_w,
+        image_height=render_h,
+    )
+
+    depth_map = rendering.depth[0, 0]
+    center_x = render_w // 2
+    center_y = render_h // 2
+    center_depth = depth_map[center_y, center_x]
+    if not torch.isfinite(center_depth) or center_depth <= 0:
+        valid_depths = depth_map[depth_map > 0]
+        center_depth = valid_depths.median() if valid_depths.numel() > 0 else torch.tensor(
+            1.0, device=device
+        )
+
+    fx = intrinsics[0, 0]
+    fy = intrinsics[1, 1]
+    cx = intrinsics[0, 2]
+    cy = intrinsics[1, 2]
+
+    center_point = torch.stack(
+        [
+            (center_x - cx) * center_depth / fx,
+            (center_y - cy) * center_depth / fy,
+            center_depth,
+        ],
+        dim=0,
+    )
+
+    orbit_radius = torch.clamp(center_depth, min=1e-4)
+    base_offset = torch.tensor([0.0, 0.0, -orbit_radius], device=device)
+
+    yaw_rad = torch.deg2rad(torch.tensor(yaw_deg, device=device))
+    pitch_rad = torch.deg2rad(torch.tensor(pitch_deg, device=device))
+
+    cos_yaw = torch.cos(yaw_rad)
+    sin_yaw = torch.sin(yaw_rad)
+    cos_pitch = torch.cos(pitch_rad)
+    sin_pitch = torch.sin(pitch_rad)
+
+    zero = torch.tensor(0.0, device=device)
+    one = torch.tensor(1.0, device=device)
+    yaw_matrix = torch.stack(
+        [
+            torch.stack([cos_yaw, zero, -sin_yaw]),
+            torch.stack([zero, one, zero]),
+            torch.stack([sin_yaw, zero, cos_yaw]),
+        ]
+    )
+    pitch_matrix = torch.stack(
+        [
+            torch.stack([one, zero, zero]),
+            torch.stack([zero, cos_pitch, -sin_pitch]),
+            torch.stack([zero, sin_pitch, cos_pitch]),
+        ]
+    )
+
+    rotated_offset = pitch_matrix @ (yaw_matrix @ base_offset)
+    camera_position = center_point + rotated_offset
+    world_up = torch.tensor([0.0, -1.0, 0.0], device=device)
+
+    return camera.create_camera_matrix(
+        position=camera_position,
+        look_at_position=center_point,
+        world_up=world_up,
+        inverse=True,
+    )
+
+
 @app.route("/")
 def index():
     """Serve the main page."""
