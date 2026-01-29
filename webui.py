@@ -276,23 +276,41 @@ def _build_view_extrinsics_from_angles(
     device: torch.device,
     radius: float = 3.0,
 ) -> list[torch.Tensor]:
-    """Create extrinsics matrices for yaw/pitch camera angles."""
+    """Create extrinsics matrices for yaw/pitch camera angles relative to the default view."""
     look_at = torch.zeros(3, device=device)
-    world_up = torch.tensor([0.0, 0.0, 1.0], device=device)
+    world_up = torch.tensor([0.0, -1.0, 0.0], device=device)
     extrinsics_list = []
+    base_offset = torch.tensor([0.0, 0.0, -radius], device=device, dtype=torch.float32)
 
     for yaw, pitch in angle_pairs:
         yaw_rad = math.radians(yaw)
         pitch_rad = math.radians(pitch)
-        position = torch.tensor(
+
+        cos_yaw = math.cos(yaw_rad)
+        sin_yaw = math.sin(yaw_rad)
+        cos_pitch = math.cos(pitch_rad)
+        sin_pitch = math.sin(pitch_rad)
+
+        yaw_matrix = torch.tensor(
             [
-                radius * math.cos(pitch_rad) * math.cos(yaw_rad),
-                radius * math.cos(pitch_rad) * math.sin(yaw_rad),
-                radius * math.sin(pitch_rad),
+                [cos_yaw, 0.0, -sin_yaw],
+                [0.0, 1.0, 0.0],
+                [sin_yaw, 0.0, cos_yaw],
             ],
             device=device,
             dtype=torch.float32,
         )
+        pitch_matrix = torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, cos_pitch, -sin_pitch],
+                [0.0, sin_pitch, cos_pitch],
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+
+        position = look_at + (pitch_matrix @ (yaw_matrix @ base_offset))
         extrinsics = camera.create_camera_matrix(
             position, look_at_position=look_at, world_up=world_up, inverse=True
         )
