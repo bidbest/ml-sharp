@@ -126,6 +126,11 @@
             min-width: 0;
         }
 
+        .path-input-container .text-input {
+            flex: 1;
+            min-width: 0;
+        }
+
         .path-input-container input[type="text"]:focus {
             border-color: #00d4ff;
         }
@@ -692,6 +697,21 @@
             background: #1a1a2e;
         }
 
+        .text-input {
+            width: 100%;
+            padding: 10px;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: white;
+            border-radius: 8px;
+            outline: none;
+            resize: vertical;
+        }
+
+        .text-input:focus {
+            border-color: #00d4ff;
+        }
+
         .checkbox-container {
             display: flex;
             align-items: center;
@@ -996,6 +1016,64 @@
                             <small class="hint" style="display:block; margin-top:10px; color:#888;">
                                 Creates a 3840x1080 SBS video with audio. Slow processing.
                             </small>
+
+                            <div class="checkbox-container" style="margin-top: 15px;">
+                                <input type="checkbox" id="multi-view-toggle">
+                                <label for="multi-view-toggle" style="cursor:pointer; color: #00d4ff;">Render Multi-View
+                                    Frames (PNG Sequence)</label>
+                            </div>
+
+                            <div id="multi-view-settings"
+                                style="display:none; padding-left: 20px; border-left: 2px solid #00d4ff; margin-top: 10px;">
+                                <div class="input-group" style="margin-bottom: 8px;">
+                                    <label>Number of Views:</label>
+                                    <input type="number" id="multi-view-count" class="text-input" min="1" value="8">
+                                    <small class="hint">Must match the number of yaw/pitch pairs. Leave blank to infer.
+                                    </small>
+                                </div>
+
+                                <div class="input-group" style="margin-bottom: 8px;">
+                                    <label>Yaw/Pitch Angle List (CSV pairs):</label>
+                                    <textarea id="multi-view-angle-list" class="text-input" rows="4"
+                                        placeholder="Example: 0,0; 30,0; -30,0&#10;Or one pair per line"></textarea>
+                                    <small class="hint">Format: yaw,pitch per entry. If provided, overrides the grid
+                                        settings below.</small>
+                                </div>
+
+                                <div class="input-group" style="margin-bottom: 8px;">
+                                    <label>Yaw Range (deg):</label>
+                                    <div class="path-input-container">
+                                        <input type="text" id="multi-view-yaw-start" class="text-input"
+                                            placeholder="-30" value="-30">
+                                        <input type="text" id="multi-view-yaw-end" class="text-input" placeholder="30"
+                                            value="30">
+                                        <input type="text" id="multi-view-yaw-step" class="text-input" placeholder="15"
+                                            value="15">
+                                    </div>
+                                    <small class="hint">Start / End / Step values.</small>
+                                </div>
+
+                                <div class="input-group" style="margin-bottom: 8px;">
+                                    <label>Pitch Range (deg):</label>
+                                    <div class="path-input-container">
+                                        <input type="text" id="multi-view-pitch-start" class="text-input"
+                                            placeholder="0" value="0">
+                                        <input type="text" id="multi-view-pitch-end" class="text-input" placeholder="0"
+                                            value="0">
+                                        <input type="text" id="multi-view-pitch-step" class="text-input" placeholder="15"
+                                            value="15">
+                                    </div>
+                                    <small class="hint">Start / End / Step values.</small>
+                                </div>
+
+                                <button class="sbs-preview-btn" id="multi-view-preview-btn" type="button">
+                                    <span class="spinner"></span>
+                                    <span class="btn-text">👁️ Preview Multi-View Frame</span>
+                                </button>
+                                <small class="hint" style="display:block; margin-top:5px;">
+                                    Generates a preview grid for the current frame using your multi-view settings.
+                                </small>
+                            </div>
                         </div>
                     </div>
 
@@ -1257,6 +1335,16 @@
         const sbsOpacity = document.getElementById('sbs-opacity');
         const sbsOffset = document.getElementById('sbs-offset');
         const sbsBrightness = document.getElementById('sbs-brightness');
+        const multiViewToggle = document.getElementById('multi-view-toggle');
+        const multiViewSettings = document.getElementById('multi-view-settings');
+        const multiViewCount = document.getElementById('multi-view-count');
+        const multiViewAngleList = document.getElementById('multi-view-angle-list');
+        const multiViewYawStart = document.getElementById('multi-view-yaw-start');
+        const multiViewYawEnd = document.getElementById('multi-view-yaw-end');
+        const multiViewYawStep = document.getElementById('multi-view-yaw-step');
+        const multiViewPitchStart = document.getElementById('multi-view-pitch-start');
+        const multiViewPitchEnd = document.getElementById('multi-view-pitch-end');
+        const multiViewPitchStep = document.getElementById('multi-view-pitch-step');
 
         // Webcam Elements
         const webcamFeed = document.getElementById('webcam-feed');
@@ -1274,10 +1362,13 @@
             // FORCE UNCHECK ON LOAD
             if (sbsToggle) sbsToggle.checked = false;
             if (sbsSettings) sbsSettings.style.display = 'none';
+            if (multiViewToggle) multiViewToggle.checked = false;
+            if (multiViewSettings) multiViewSettings.style.display = 'none';
 
             setupEventListeners();
             setupResizeObserver();
             await checkServerStatus();
+            updateVideoOutputSettings();
         }
 
         function setupResizeObserver() {
@@ -1318,12 +1409,20 @@
 
             // SBS Settings Toggle
             sbsToggle.addEventListener('change', function () {
-                if (this.checked) {
-                    sbsSettings.style.display = 'block';
-                } else {
-                    sbsSettings.style.display = 'none';
+                if (this.checked && multiViewToggle.checked) {
+                    multiViewToggle.checked = false;
                 }
+                updateVideoOutputSettings();
             });
+
+            if (multiViewToggle) {
+                multiViewToggle.addEventListener('change', function () {
+                    if (this.checked && sbsToggle.checked) {
+                        sbsToggle.checked = false;
+                    }
+                    updateVideoOutputSettings();
+                });
+            }
 
             // SBS Preview
             const sbsPreviewBtn = document.getElementById('sbs-preview-btn');
@@ -1333,6 +1432,10 @@
 
             if (sbsPreviewBtn) {
                 sbsPreviewBtn.addEventListener('click', handleSbsPreview);
+            }
+            const multiViewPreviewBtn = document.getElementById('multi-view-preview-btn');
+            if (multiViewPreviewBtn) {
+                multiViewPreviewBtn.addEventListener('click', handleMultiViewPreview);
             }
             if (sbsPreviewClose) {
                 sbsPreviewClose.addEventListener('click', closeSbsPreviewModal);
@@ -1383,6 +1486,19 @@
                 sbsBtn.style.color = "";
             }
             window.focus();
+        }
+
+        function updateVideoOutputSettings() {
+            if (sbsToggle.checked) {
+                sbsSettings.style.display = 'block';
+                if (multiViewSettings) multiViewSettings.style.display = 'none';
+            } else if (multiViewToggle && multiViewToggle.checked) {
+                sbsSettings.style.display = 'none';
+                if (multiViewSettings) multiViewSettings.style.display = 'block';
+            } else {
+                sbsSettings.style.display = 'none';
+                if (multiViewSettings) multiViewSettings.style.display = 'none';
+            }
         }
 
         /* --- MODE SWITCHING --- */
@@ -1464,6 +1580,10 @@
 
                 sbsPreviewImage.src = imageUrl;
                 sbsPreviewModal.classList.add('visible');
+                const sbsPreviewHint = sbsPreviewModal ? sbsPreviewModal.querySelector('.sbs-preview-hint') : null;
+                if (sbsPreviewHint) {
+                    sbsPreviewHint.textContent = 'Press ESC to close | F for fullscreen | Use this to test your 3D settings';
+                }
                 showStatus("SBS preview ready! View fullscreen to test the 3D effect.", "success");
 
             } catch (error) {
@@ -1472,6 +1592,75 @@
             } finally {
                 sbsPreviewBtn.classList.remove('loading');
                 sbsPreviewBtn.disabled = false;
+            }
+        }
+
+        async function handleMultiViewPreview() {
+            if (!selectedFile || !isVideoMode) {
+                showStatus("Please load a video first", "error");
+                return;
+            }
+
+            const multiViewPreviewBtn = document.getElementById('multi-view-preview-btn');
+            const sbsPreviewModal = document.getElementById('sbs-preview-modal');
+            const sbsPreviewImage = document.getElementById('sbs-preview-image');
+
+            const videoEl = document.getElementById('preview-video');
+            if (!videoEl || !videoEl.duration) {
+                showStatus("Video not loaded properly", "error");
+                return;
+            }
+
+            const estimatedFps = 30;
+            const currentTime = videoEl.currentTime;
+            const frameNumber = Math.floor(currentTime * estimatedFps);
+            const quality = document.getElementById('quality-selector').value;
+
+            multiViewPreviewBtn.classList.add('loading');
+            multiViewPreviewBtn.disabled = true;
+            showStatus(`Generating multi-view preview for frame ${frameNumber}...`, 'info');
+
+            try {
+                const formData = new FormData();
+                formData.append('video', selectedFile);
+                formData.append('frame_number', frameNumber);
+                formData.append('quality', quality);
+                formData.append('num_views', multiViewCount.value);
+                formData.append('angle_list', multiViewAngleList.value);
+                formData.append('yaw_start', multiViewYawStart.value);
+                formData.append('yaw_end', multiViewYawEnd.value);
+                formData.append('yaw_step', multiViewYawStep.value);
+                formData.append('pitch_start', multiViewPitchStart.value);
+                formData.append('pitch_end', multiViewPitchEnd.value);
+                formData.append('pitch_step', multiViewPitchStep.value);
+
+                const response = await fetch('/preview_multi_view_frame', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.error || 'Preview generation failed');
+                }
+
+                const imageBlob = await response.blob();
+                const imageUrl = URL.createObjectURL(imageBlob);
+
+                sbsPreviewImage.src = imageUrl;
+                sbsPreviewModal.classList.add('visible');
+                const sbsPreviewHint = sbsPreviewModal ? sbsPreviewModal.querySelector('.sbs-preview-hint') : null;
+                if (sbsPreviewHint) {
+                    sbsPreviewHint.textContent = 'Press ESC to close | F for fullscreen | Multi-view preview grid';
+                }
+                showStatus("Multi-view preview ready!", "success");
+
+            } catch (error) {
+                console.error("Multi-view Preview error:", error);
+                showStatus("Preview failed: " + error.message, "error");
+            } finally {
+                multiViewPreviewBtn.classList.remove('loading');
+                multiViewPreviewBtn.disabled = false;
             }
         }
 
@@ -1712,6 +1901,17 @@
                     formData.append('stereo_offset', sbsOffset.value);
                     formData.append('brightness_factor', sbsBrightness.value);
                     showStatus('Starting SBS 3D Movie generation (Frames + Rendering)...(Stop at anytime to output movie)', 'info');
+                } else if (multiViewToggle && multiViewToggle.checked) {
+                    formData.append('output_mode', 'multi_view_frames');
+                    formData.append('num_views', multiViewCount.value);
+                    formData.append('angle_list', multiViewAngleList.value);
+                    formData.append('yaw_start', multiViewYawStart.value);
+                    formData.append('yaw_end', multiViewYawEnd.value);
+                    formData.append('yaw_step', multiViewYawStep.value);
+                    formData.append('pitch_start', multiViewPitchStart.value);
+                    formData.append('pitch_end', multiViewPitchEnd.value);
+                    formData.append('pitch_step', multiViewPitchStep.value);
+                    showStatus('Starting multi-view frame rendering...', 'info');
                 } else {
                     formData.append('output_mode', 'ply_seq');
                     showStatus('Initializing video generation...', 'info');
@@ -1755,17 +1955,20 @@
                     if (res.status !== 200) { clearInterval(statusPollInterval); showStatus(data.error, 'error'); return; }
 
                     const isSBS = (data.mode === 'sbs_movie');
+                    const isMultiView = (data.mode === 'multi_view_frames');
                     const percent = data.total > 0 ? Math.round((data.processed / data.total) * 100) : 0;
                     progressBarFill.style.width = percent + '%';
 
                     if (isSBS) {
                         progressBarText.textContent = `Rendering SBS Movie: Frame ${data.processed} / ${data.total}`;
+                    } else if (isMultiView) {
+                        progressBarText.textContent = `Rendering Multi-View Frames: ${data.processed} / ${data.total}`;
                     } else {
                         progressBarText.textContent = `Processing Frame ${data.processed} / ${data.total}`;
                     }
 
                     // Show progress in viewer if not SBS mode
-                    if (!isSBS && data.files.length > 0) {
+                    if (!isSBS && !isMultiView && data.files.length > 0) {
                         const lastFile = data.files[data.files.length - 1];
                         const url = data.base_url + lastFile;
                         if (url !== lastLoadedFrameUrl) {
@@ -1816,6 +2019,31 @@
                                 downloadSection.classList.add('visible');
 
                                 // Reset UI elements
+                                document.querySelector('.mode-tabs').style.display = 'none';
+                                createView.style.display = 'none';
+                                resetAppBtn.style.display = 'flex';
+
+                            } else if (isMultiView) {
+                                showStatus("Multi-view frames generated successfully! Check the output folder for PNGs.", 'success');
+
+                                downloadBtn.removeAttribute('href');
+                                downloadBtn.style.cursor = "pointer";
+                                downloadBtn.onclick = async (e) => {
+                                    e.preventDefault();
+                                    try {
+                                        await fetch('/open_output_folder', { method: 'POST' });
+                                    } catch (err) {
+                                        console.error("Failed to open folder", err);
+                                        showStatus("Could not open folder automatically.", "error");
+                                    }
+                                };
+
+                                downloadBtn.innerHTML = `
+                                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 19a2 2 0 01-2-2V7a2 2 0 012-2h4l2 2h4a2 2 0 012 2v1M5 19h14a2 2 0 002-2v-5a2 2 0 00-2-2H9a2 2 0 00-2 2v5a2 2 0 01-2 2z" />
+                                </svg> Open Output Folder`;
+
+                                downloadSection.classList.add('visible');
                                 document.querySelector('.mode-tabs').style.display = 'none';
                                 createView.style.display = 'none';
                                 resetAppBtn.style.display = 'flex';
