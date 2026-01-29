@@ -730,6 +730,182 @@ def _process_sbs_video_job(job_id, tmp_path, original_stem, unique_id, predictor
         # if work_dir.exists(): try: shutil.rmtree(work_dir) except: pass
 
 
+def _build_multiview_cameras(
+    gaussians: Gaussians3D,
+    intrinsics: torch.Tensor,
+    resolution_px: tuple[int, int],
+    f_px: float,
+    num_views: int,
+) -> list[camera.CameraInfo]:
+    """Build camera info objects for multi-view rendering."""
+    params = camera.TrajectoryParams(num_steps=num_views)
+    camera_model = camera.create_camera_model(
+        gaussians, intrinsics, resolution_px=resolution_px
+    )
+    trajectory = camera.create_eye_trajectory(
+        gaussians, params, resolution_px=resolution_px, f_px=f_px
+    )
+    return [camera_model.compute(eye_pos) for eye_pos in trajectory[:num_views]]
+
+
+def _process_multiview_video_job(
+    job_id,
+    tmp_path,
+    original_stem,
+    predictor,
+    device,
+    fps,
+    use_fp16,
+    num_views,
+    batch_size,
+):
+    """Background worker for multi-view frame rendering."""
+    if device.type != 'cuda':
+        _active_jobs[job_id]['status'] = 'error'
+        _active_jobs[job_id]['error_msg'] = "Multi-view rendering requires a CUDA GPU."
+        return
+
+    job_prefix = get_next_job_prefix()
+    work_dir = OUTPUT_DIR / f"{job_prefix}_{original_stem}_multiview"
+    work_dir.mkdir(exist_ok=True)
+
+    LOGGER.info(
+        f"Job {job_id} [{job_prefix}] | Batch: {batch_size} | Views: {num_views} | Folder: {work_dir}"
+    )
+
+    reader = None
+    try:
+        try:
+            reader = iio.get_reader(tmp_path)
+            total_frames = reader.count_frames()
+            _active_jobs[job_id]['total_frames'] = total_frames
+        except Exception:
+            _active_jobs[job_id]['total_frames'] = 0
+            reader = iio.get_reader(tmp_path)
+
+        renderer = gsplat.GSplatRenderer(color_space="linearRGB")
+
+        batch_frames = []
+        batch_indices = []
+
+        def process_multiview_batch(frames, indices):
+            try:
+                clean_frames = []
+                for f in frames:
+                    if f.shape[2] > 3:
+                        clean_frames.append(f[:, :, :3])
+                    else:
+                        clean_frames.append(f)
+
+                h, w = clean_frames[0].shape[:2]
+                f_px = io.convert_focallength(w, h, 30.0)
+
+                gaussians_list = predict_batch(
+                    predictor, clean_frames, f_px, device, use_fp16=use_fp16
+                )
+
+                intrinsics = torch.tensor(
+                    [
+                        [f_px, 0, (w - 1) / 2.0, 0],
+                        [0, f_px, (h - 1) / 2.0, 0],
+                        [0, 0, 1, 0],
+                        [0, 0, 0, 1],
+                    ],
+                    device=device,
+                    dtype=torch.float32,
+                )
+
+                for k, gaussians in enumerate(gaussians_list):
+                    frame_idx = indices[k]
+                    camera_infos = _build_multiview_cameras(
+                        gaussians,
+                        intrinsics,
+                        resolution_px=(w, h),
+                        f_px=f_px,
+                        num_views=num_views,
+                    )
+
+                    for view_idx, camera_info in enumerate(camera_infos):
+                        rendering_output = renderer(
+                            gaussians,
+                            extrinsics=camera_info.extrinsics[None],
+                            intrinsics=camera_info.intrinsics[None],
+                            image_width=camera_info.width,
+                            image_height=camera_info.height,
+                        )
+                        img_tensor = rendering_output.color[0].clamp(0, 1)
+                        img = (img_tensor.permute(1, 2, 0) * 255).byte().cpu().numpy()
+                        frame_name = f"frame_{frame_idx:05d}_view_{view_idx:02d}.png"
+                        frame_path = work_dir / frame_name
+                        Image.fromarray(img).save(frame_path)
+
+                        relative_path = f"{work_dir.name}/{frame_name}"
+                        _active_jobs[job_id]['files'].append(relative_path)
+
+                    _active_jobs[job_id]['processed_frames'] = frame_idx + 1
+
+                    del gaussians, camera_infos
+
+                torch.cuda.empty_cache()
+                gc.collect()
+
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() and len(frames) > 1:
+                    LOGGER.warning(
+                        f"OOM in multi-view job with batch {len(frames)}. Switching to 1."
+                    )
+                    torch.cuda.empty_cache()
+                    for i in range(len(frames)):
+                        process_multiview_batch([frames[i]], [indices[i]])
+                    return True
+                else:
+                    raise e
+            return False
+
+        fallback_mode = False
+        for i, frame in enumerate(reader):
+            if _active_jobs[job_id]['stop_signal']:
+                LOGGER.info(f"Job {job_id} stopped by user.")
+                _active_jobs[job_id]['status'] = 'stopped'
+                break
+
+            batch_frames.append(frame)
+            batch_indices.append(i)
+
+            effective_bs = 1 if fallback_mode else batch_size
+            if len(batch_frames) >= effective_bs:
+                oom = process_multiview_batch(batch_frames, batch_indices)
+                if oom:
+                    fallback_mode = True
+                batch_frames = []
+                batch_indices = []
+
+            if i % 10 == 0:
+                LOGGER.info(f"Job {job_id}: Multi-view rendered frame {i+1}")
+
+        if batch_frames and not _active_jobs[job_id]['stop_signal']:
+            process_multiview_batch(batch_frames, batch_indices)
+
+        if not _active_jobs[job_id]['stop_signal']:
+            _active_jobs[job_id]['status'] = 'done'
+
+    except Exception as e:
+        LOGGER.exception(f"Job {job_id} failed")
+        _active_jobs[job_id]['status'] = 'error'
+        _active_jobs[job_id]['error_msg'] = str(e)
+    finally:
+        if reader:
+            try:
+                reader.close()
+            except:
+                pass
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except:
+                pass
+
+
 @app.route("/preview_sbs_frame", methods=["POST"])
 def preview_sbs_frame():
     """Generate a single SBS preview frame from a video for testing settings."""
@@ -898,6 +1074,12 @@ def generate_video():
     opacity_threshold = float(request.form.get('opacity_threshold', 0.0))
     stereo_offset = float(request.form.get('stereo_offset', 0.015))
     brightness_factor = float(request.form.get('brightness_factor', 1.0))
+    try:
+        num_views = int(request.form.get('num_views', 6))
+        if num_views < 1:
+            num_views = 1
+    except ValueError:
+        num_views = 6
     
     # BATCH SIZE parsing
     try:
@@ -948,6 +1130,21 @@ def generate_video():
                 target=_process_sbs_video_job,
                 args=(job_id, tmp_path, original_stem, unique_id, predictor, device, fps, use_fp16, opacity_threshold, stereo_offset, brightness_factor, batch_size)
             )
+        elif output_mode == 'multi_view':
+            thread = threading.Thread(
+                target=_process_multiview_video_job,
+                args=(
+                    job_id,
+                    tmp_path,
+                    original_stem,
+                    predictor,
+                    device,
+                    fps,
+                    use_fp16,
+                    num_views,
+                    batch_size,
+                ),
+            )
         else:
             thread = threading.Thread(
                 target=_process_video_job,
@@ -982,7 +1179,7 @@ def job_status(job_id):
         "fps": job["fps"],
         "error": job["error_msg"],
         "mode": job.get("mode", "ply_seq"),
-        "base_url": "/download/" if job.get("mode") == "sbs_movie" else "/ply/"
+        "base_url": "/download/" if job.get("mode") in {"sbs_movie", "multi_view"} else "/ply/"
     })
 
 
